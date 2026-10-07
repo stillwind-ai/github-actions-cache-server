@@ -1,39 +1,25 @@
-ARG BASE_IMAGE=node:26-alpine
-
-FROM ${BASE_IMAGE} AS builder
+FROM rust:1.97-bookworm AS builder
 
 WORKDIR /app
 
-RUN --mount=type=cache,target=/root/.npm npm install -g pnpm@latest-11
-
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-
-RUN --mount=type=cache,target=/root/.local/share/pnpm/store pnpm fetch --prod
-RUN --mount=type=cache,target=/root/.local/share/pnpm/store pnpm install --frozen-lockfile --prod --offline
-
-COPY . .
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
 
 ARG BUILD_HASH
 ENV BUILD_HASH=${BUILD_HASH}
-RUN pnpm run build
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo build --release --locked \
+    && cp target/release/github-actions-cache-server /usr/local/bin/
 
 # --------------------------------------------
 
-FROM ${BASE_IMAGE} AS runner
+# glibc, CA certificates and nothing else.
+FROM gcr.io/distroless/cc-debian12 AS runner
 
-ARG BASE_IMAGE
+COPY --from=builder /usr/local/bin/github-actions-cache-server /usr/local/bin/github-actions-cache-server
 
-ENV NITRO_CLUSTER_WORKERS=1
-ENV NODE_CAGED=false
+ENV PORT=3000
+EXPOSE 3000
 
-WORKDIR /app
-
-COPY --from=builder /app/.output ./
-
-RUN if echo "$BASE_IMAGE" | grep -q "node-caged"; then \
-			echo "export NODE_CAGED=true" > /app/.runtime-env; \
-		else \
-			echo "export NODE_CAGED=false" > /app/.runtime-env; \
-		fi
-
-CMD ["sh", "-c", ". /app/.runtime-env && exec node --expose-gc /app/server/index.mjs"]
+ENTRYPOINT ["/usr/local/bin/github-actions-cache-server"]

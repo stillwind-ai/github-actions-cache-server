@@ -13,48 +13,46 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   lint:
     name: 💅 Lint
     runs-on: ubuntu-latest
     steps:
-      - name: pnpm install
-        uses: falcondev-it/.github/actions/pnpm-install@master
-
-      - name: Cache ESLint & Prettier
-        uses: actions/cache@v5
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          path: |
-            .eslintcache
-            node_modules/.cache/prettier/.prettier-cache
-          key: eslint-prettier-cache-${{ runner.os }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
 
-      - run: pnpm run lint:ci
-
-  type-check:
-    name: 🛃 Type Check
-    runs-on: ubuntu-latest
-    steps:
-      - name: pnpm install
-        uses: falcondev-it/.github/actions/pnpm-install@master
-
-      - run: pnpm run type-check
-
-  test-unit:
-    name: 🧪 Unit Tests
+  test:
+    name: 🧪 Tests (io_uring ${{ matrix.io-uring }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        storage-driver: [filesystem, s3, gcs]
-        db-driver: [postgres, mysql, sqlite]
-    steps:
-      - name: pnpm install
-        uses: falcondev-it/.github/actions/pnpm-install@master
-
-      - run: pnpm run test:run
+        io-uring: [true, false]
+    services:
+      postgres:
+        image: postgres:17
         env:
-          VITEST_DB_DRIVER: ${{ matrix.db-driver }}
-          VITEST_STORAGE_DRIVER: ${{ matrix.storage-driver }}
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      STORAGE_FILESYSTEM_IO_URING: ${{ matrix.io-uring }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
 
   deploy:
     if: github.event.ref == 'refs/heads/dev'
@@ -62,7 +60,7 @@ jobs:
     permissions:
       packages: write
       contents: read
-    needs: [lint, type-check, test-unit]
+    needs: [lint, test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -104,23 +102,3 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             BUILD_HASH=${{ steps.build_hash.outputs.COMMIT_SHA }}
-
-      - name: Extract metadata (tags, labels) for Docker (caged)
-        id: meta-caged
-        uses: docker/metadata-action@v6
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            dev-caged
-
-      - name: Build and push (caged)
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta-caged.outputs.tags }}
-          labels: ${{ steps.meta-caged.outputs.labels }}
-          build-args: |
-            BUILD_HASH=${{ steps.build_hash.outputs.COMMIT_SHA }}
-            BASE_IMAGE=platformatic/node-caged:26-alpine

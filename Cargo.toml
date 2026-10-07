@@ -1,0 +1,65 @@
+[package]
+name = "github-actions-cache-server"
+version = "9.8.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Self-hosted drop-in replacement for the GitHub Actions cache service"
+publish = false
+
+[lib]
+name = "cache_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "github-actions-cache-server"
+path = "src/main.rs"
+
+[features]
+default = ["io-uring"]
+# Filesystem storage I/O through io_uring (tokio-uring, Linux only). Without it,
+# or when the kernel refuses an io_uring instance at startup, file I/O goes
+# through tokio::fs.
+io-uring = ["dep:tokio-uring", "dep:io-uring"]
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+dotenvy = "0.15"
+futures = "0.3"
+http-body-util = "0.1"
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "rust_crypto"] }
+prometheus = { version = "0.14", default-features = false, features = ["process"] }
+prost = "0.14"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots", "stream", "json", "http2"] }
+rustix = { version = "1", features = ["fs"] }
+sea-orm = { version = "2.0.4", default-features = false, features = ["macros", "with-chrono", "with-uuid", "with-json", "sqlx-postgres", "runtime-tokio-rustls"] }
+sea-orm-migration = { version = "2.0.4", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt", "io"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-uring = { version = "0.5", optional = true, features = ["bytes"] }
+io-uring = { version = "0.6", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
