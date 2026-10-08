@@ -1,5 +1,5 @@
 //! A self-hosted drop-in replacement for the GitHub Actions cache service,
-//! with filesystem storage and a Postgres database.
+//! with filesystem or S3 storage and a Postgres database.
 
 pub mod auth;
 pub mod cleanup;
@@ -43,19 +43,41 @@ impl App {
             .context("Database migration failed")?;
         tracing::info!("Database migrated");
 
-        let io = storage::io::FileIo::new(
-            config.storage_filesystem_io_uring,
-            config.storage_filesystem_io_uring_threads,
-        );
-        let fs = storage::fs::FsStorage::new(&config.storage_filesystem_path, io)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to initialize storage at {}",
-                    config.storage_filesystem_path.display()
-                )
-            })?;
-        let storage = Arc::new(storage::Storage::new(db, fs, config.clone()));
+        let backend = match &config.storage_driver {
+            config::StorageDriver::Filesystem => {
+                let io = storage::io::FileIo::new(
+                    config.storage_filesystem_io_uring,
+                    config.storage_filesystem_io_uring_threads,
+                );
+                let fs = storage::fs::FsStorage::new(&config.storage_filesystem_path, io)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to initialize storage at {}",
+                            config.storage_filesystem_path.display()
+                        )
+                    })?;
+                storage::backend::Backend::Filesystem(fs)
+            }
+            config::StorageDriver::S3(settings) => {
+                let s3 = storage::s3::S3Storage::new(settings)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to initialize S3 storage in bucket {}",
+                            settings.bucket
+                        )
+                    })?;
+                if config.cache_max_size_bytes.is_none() {
+                    tracing::info!(
+                        "S3 storage has no capacity limit: set CACHE_MAX_SIZE_BYTES to enable Capacity-based Eviction"
+                    );
+                }
+                storage::backend::Backend::S3(s3)
+            }
+        };
+        tracing::info!(driver = backend.name(), "Storage initialized");
+        let storage = Arc::new(storage::Storage::new(db, backend, config.clone()));
         let cleanup = Arc::new(cleanup::Cleanup::new(storage.clone(), config.clone()));
 
         let state = AppState {

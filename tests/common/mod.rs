@@ -1,5 +1,7 @@
 //! Test harness: a real server on a random port, backed by a fresh Postgres
-//! database (from `TEST_DATABASE_URL`) and a temporary storage directory.
+//! database (from `TEST_DATABASE_URL`) and fresh storage: a temporary
+//! directory, or with `TEST_STORAGE_DRIVER=s3` a new bucket on the S3 server
+//! at `TEST_S3_ENDPOINT`.
 
 #![allow(dead_code)]
 
@@ -7,11 +9,15 @@ use std::collections::HashMap;
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use bytes::Bytes;
+use cache_server::config::S3Settings;
+use cache_server::storage::backend::{Backend, StorageFolder};
 use cache_server::{App, AppState, Config};
 use sea_orm::{ConnectionTrait, Database};
 use serde_json::{Value, json};
 
 pub const DEFAULT_DATABASE_URL: &str = "postgres://postgres@127.0.0.1:5432/postgres";
+pub const DEFAULT_S3_ENDPOINT: &str = "http://127.0.0.1:9000";
 
 pub struct TestServer {
     pub url: String,
@@ -41,6 +47,44 @@ pub fn main_token() -> String {
         json!([{ "Scope": "refs/heads/main", "Permission": 3 }]),
         "123",
     )
+}
+
+pub fn testing_s3() -> bool {
+    std::env::var("TEST_STORAGE_DRIVER").is_ok_and(|driver| driver == "s3")
+}
+
+fn env_or(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.into())
+}
+
+/// Creates a bucket for one test, waiting for the S3 server to come up.
+async fn create_bucket() -> S3Settings {
+    let settings = S3Settings {
+        bucket: format!("test-{}", uuid::Uuid::new_v4().simple()),
+        region: "us-east-1".into(),
+        endpoint_url: Some(env_or("TEST_S3_ENDPOINT", DEFAULT_S3_ENDPOINT)),
+        access_key_id: Some(env_or("TEST_S3_ACCESS_KEY_ID", "access_key")),
+        secret_access_key: Some(env_or("TEST_S3_SECRET_ACCESS_KEY", "secret_key")),
+        session_token: None,
+        force_path_style: true,
+        socket_timeout: std::time::Duration::from_secs(30),
+    };
+    let client = cache_server::storage::s3::client(&settings).await;
+    let mut attempts = 0;
+    loop {
+        match client.create_bucket().bucket(&settings.bucket).send().await {
+            Ok(_) => return settings,
+            Err(err) if attempts < 60 => {
+                attempts += 1;
+                tracing::debug!(error = %err, "S3 server not ready");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(err) => panic!(
+                "create a bucket on TEST_S3_ENDPOINT: {}",
+                aws_sdk_s3::error::DisplayErrorContext(err)
+            ),
+        }
+    }
 }
 
 async fn create_database() -> String {
@@ -90,6 +134,19 @@ pub async fn start_with(overrides: &[(&str, &str)]) -> TestServer {
         "STORAGE_FILESYSTEM_PATH".into(),
         storage_dir.path().join("storage").display().to_string(),
     );
+    if testing_s3() {
+        let s3 = create_bucket().await;
+        for (key, value) in [
+            ("STORAGE_DRIVER", "s3".to_owned()),
+            ("STORAGE_S3_BUCKET", s3.bucket),
+            ("AWS_REGION", s3.region),
+            ("AWS_ENDPOINT_URL", s3.endpoint_url.unwrap()),
+            ("AWS_ACCESS_KEY_ID", s3.access_key_id.unwrap()),
+            ("AWS_SECRET_ACCESS_KEY", s3.secret_access_key.unwrap()),
+        ] {
+            vars.insert(key.into(), value);
+        }
+    }
     // Lets CI run the suite against both the io_uring and tokio::fs paths.
     if let Ok(io_uring) = std::env::var("STORAGE_FILESYSTEM_IO_URING") {
         vars.insert("STORAGE_FILESYSTEM_IO_URING".into(), io_uring);
@@ -125,8 +182,70 @@ pub fn block_id(index: usize) -> String {
 }
 
 impl TestServer {
+    pub fn backend(&self) -> &Backend {
+        self.state.storage.backend()
+    }
+
+    pub fn is_s3(&self) -> bool {
+        matches!(self.backend(), Backend::S3(_))
+    }
+
+    /// The storage directory; only for filesystem storage.
     pub fn storage_path(&self) -> std::path::PathBuf {
-        self.state.storage.fs().root().to_path_buf()
+        match self.backend() {
+            Backend::Filesystem(fs) => fs.root().to_path_buf(),
+            Backend::S3(_) => panic!("S3 storage has no storage path"),
+        }
+    }
+
+    pub async fn object_exists(&self, name: &str) -> bool {
+        self.backend().exists(name).await.unwrap()
+    }
+
+    /// An object's contents, `None` if it doesn't exist.
+    pub async fn read_object(&self, name: &str) -> Option<Vec<u8>> {
+        use futures::TryStreamExt;
+        match self.backend().read(name).await {
+            Ok(stream) => {
+                let chunks: Vec<_> = stream.try_collect().await.unwrap();
+                Some(chunks.concat())
+            }
+            Err(cache_server::storage::backend::StorageError::NotFound(_)) => None,
+            Err(err) => panic!("read {name}: {err}"),
+        }
+    }
+
+    pub async fn put_object(&self, name: &str, data: &[u8]) {
+        let data = Bytes::copy_from_slice(data);
+        self.backend()
+            .write(name, futures::stream::iter([Ok(data)]), None)
+            .await
+            .unwrap();
+    }
+
+    /// External mutation: removes a whole folder behind the server's back.
+    pub async fn remove_folder(&self, folder: &str) {
+        self.backend().delete_folder(folder).await.unwrap();
+    }
+
+    /// External mutation: removes one object behind the server's back.
+    pub async fn remove_object(&self, name: &str) {
+        match self.backend() {
+            Backend::Filesystem(fs) => std::fs::remove_file(fs.root().join(name)).unwrap(),
+            Backend::S3(s3) => {
+                s3.client()
+                    .delete_object()
+                    .bucket(s3.bucket())
+                    .key(s3.key(name).unwrap())
+                    .send()
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    pub async fn storage_folders(&self) -> Vec<StorageFolder> {
+        self.backend().list_storage_folders().await.unwrap()
     }
 
     pub async fn twirp(&self, method: &str, body: Value) -> reqwest::Response {

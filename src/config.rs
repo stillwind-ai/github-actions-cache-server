@@ -4,9 +4,18 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 
+pub use crate::storage::s3::S3Settings;
+
+/// Where cache data is stored (`STORAGE_DRIVER`).
+#[derive(Clone, Debug)]
+pub enum StorageDriver {
+    Filesystem,
+    S3(S3Settings),
+}
+
 /// Server configuration, read from the same environment variables as the
-/// original TypeScript server. Only the `postgres` database driver and the
-/// `filesystem` storage driver are supported.
+/// original TypeScript server. Only the `postgres` database driver is
+/// supported; storage is the `filesystem` or `s3` driver.
 #[derive(Clone, Debug)]
 pub struct Config {
     /// `None` listens on all interfaces: IPv6 and IPv4 where available.
@@ -23,6 +32,7 @@ pub struct Config {
     pub database_url: String,
     pub database_max_connections: u32,
 
+    pub storage_driver: StorageDriver,
     pub storage_filesystem_path: PathBuf,
     /// Use io_uring for filesystem storage I/O when the kernel allows it.
     pub storage_filesystem_io_uring: bool,
@@ -36,6 +46,9 @@ pub struct Config {
     pub orphaned_storage_grace_period_hours: u64,
     pub disable_cleanup_jobs: bool,
     pub eager_merge: bool,
+    /// Hand out presigned URLs for merged entries instead of proxying their
+    /// downloads (S3 only).
+    pub enable_direct_downloads: bool,
 
     pub management_api_key: Option<String>,
     pub debug: bool,
@@ -54,15 +67,19 @@ impl Config {
         {
             bail!("DB_DRIVER={driver} is not supported, only `postgres` is");
         }
-        if let Some(driver) = env.get("STORAGE_DRIVER")
-            && driver != "filesystem"
-        {
-            bail!("STORAGE_DRIVER={driver} is not supported, only `filesystem` is");
-        }
-        if env.bool("ENABLE_DIRECT_DOWNLOADS")?.unwrap_or(false) {
+        let storage_driver = match env.get("STORAGE_DRIVER").unwrap_or("filesystem") {
+            "filesystem" => StorageDriver::Filesystem,
+            "s3" => StorageDriver::S3(s3_settings(&env)?),
+            driver => {
+                bail!("STORAGE_DRIVER={driver} is not supported, only `filesystem` and `s3` are")
+            }
+        };
+        let mut enable_direct_downloads = env.bool("ENABLE_DIRECT_DOWNLOADS")?.unwrap_or(false);
+        if enable_direct_downloads && matches!(storage_driver, StorageDriver::Filesystem) {
             tracing::warn!(
                 "ENABLE_DIRECT_DOWNLOADS has no effect: filesystem storage has no direct-download URLs"
             );
+            enable_direct_downloads = false;
         }
 
         let host = env
@@ -139,6 +156,7 @@ impl Config {
             database_max_connections: env
                 .parsed::<u32>("DB_POSTGRES_MAX_CONNECTIONS")?
                 .unwrap_or(10),
+            storage_driver,
             storage_filesystem_path: env
                 .get("STORAGE_FILESYSTEM_PATH")
                 .unwrap_or(".data/storage/filesystem")
@@ -154,6 +172,7 @@ impl Config {
             orphaned_storage_grace_period_hours,
             disable_cleanup_jobs: env.bool("DISABLE_CLEANUP_JOBS")?.unwrap_or(false),
             eager_merge: env.bool("EAGER_MERGE")?.unwrap_or(false),
+            enable_direct_downloads,
             management_api_key: env.get("MANAGEMENT_API_KEY").map(str::to_owned),
             // The original treated any non-empty DEBUG value as enabled.
             debug: env
@@ -174,6 +193,30 @@ impl Config {
             ],
         }
     }
+}
+
+fn s3_settings(env: &Env) -> anyhow::Result<S3Settings> {
+    let endpoint_url = env.get("AWS_ENDPOINT_URL").map(str::to_owned);
+    if let Some(endpoint_url) = &endpoint_url {
+        url::Url::parse(endpoint_url).context("AWS_ENDPOINT_URL must be a URL")?;
+    }
+    Ok(S3Settings {
+        bucket: env
+            .get("STORAGE_S3_BUCKET")
+            .context("STORAGE_S3_BUCKET is required with STORAGE_DRIVER=s3")?
+            .to_owned(),
+        region: env.get("AWS_REGION").unwrap_or("us-east-1").to_owned(),
+        endpoint_url,
+        access_key_id: env.get("AWS_ACCESS_KEY_ID").map(str::to_owned),
+        secret_access_key: env.get("AWS_SECRET_ACCESS_KEY").map(str::to_owned),
+        session_token: env.get("AWS_SESSION_TOKEN").map(str::to_owned),
+        force_path_style: env.bool("STORAGE_S3_FORCE_PATH_STYLE")?.unwrap_or(true),
+        socket_timeout: std::time::Duration::from_millis(
+            env.parsed::<u64>("STORAGE_S3_SOCKET_TIMEOUT_MS")?
+                .unwrap_or(10_000)
+                .max(1),
+        ),
+    })
 }
 
 fn database_url(env: &Env) -> anyhow::Result<String> {
@@ -275,11 +318,54 @@ mod tests {
             ("API_BASE_URL", "http://localhost:3000"),
             ("DB_POSTGRES_URL", "postgres://localhost/db"),
         ];
-        for (name, value) in [("DB_DRIVER", "sqlite"), ("STORAGE_DRIVER", "s3")] {
+        for (name, value) in [("DB_DRIVER", "sqlite"), ("STORAGE_DRIVER", "gcs")] {
             let mut env = vars(&base);
             env.insert(name.into(), value.into());
             assert!(Config::from_vars(env).is_err());
         }
+    }
+
+    #[test]
+    fn reads_s3_settings() {
+        let base = vars(&[
+            ("API_BASE_URL", "http://localhost:3000"),
+            ("DB_POSTGRES_URL", "postgres://localhost/db"),
+            ("STORAGE_DRIVER", "s3"),
+            ("ENABLE_DIRECT_DOWNLOADS", "true"),
+        ]);
+        assert!(
+            Config::from_vars(base.clone()).is_err(),
+            "the bucket is required"
+        );
+
+        let mut env = base;
+        env.insert("STORAGE_S3_BUCKET".into(), "cache".into());
+        env.insert("AWS_ENDPOINT_URL".into(), "http://minio:9000".into());
+        env.insert("AWS_ACCESS_KEY_ID".into(), "key".into());
+        env.insert("AWS_SECRET_ACCESS_KEY".into(), "secret".into());
+        let config = Config::from_vars(env).unwrap();
+        let StorageDriver::S3(s3) = &config.storage_driver else {
+            panic!("expected the s3 driver");
+        };
+        assert_eq!(s3.bucket, "cache");
+        assert_eq!(s3.region, "us-east-1");
+        assert_eq!(s3.endpoint_url.as_deref(), Some("http://minio:9000"));
+        assert_eq!(s3.access_key_id.as_deref(), Some("key"));
+        assert!(s3.force_path_style);
+        assert_eq!(s3.socket_timeout, std::time::Duration::from_secs(10));
+        assert!(config.enable_direct_downloads);
+    }
+
+    #[test]
+    fn direct_downloads_need_object_storage() {
+        let config = Config::from_vars(vars(&[
+            ("API_BASE_URL", "http://localhost:3000"),
+            ("DB_POSTGRES_URL", "postgres://localhost/db"),
+            ("ENABLE_DIRECT_DOWNLOADS", "true"),
+        ]))
+        .unwrap();
+        assert!(matches!(config.storage_driver, StorageDriver::Filesystem));
+        assert!(!config.enable_direct_downloads);
     }
 
     #[test]

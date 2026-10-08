@@ -13,7 +13,7 @@ use sea_orm::{
 use serde::Serialize;
 use uuid::Uuid;
 
-use super::fs::{FsStorage, StorageError};
+use super::backend::{Backend, StorageError};
 use crate::entity::storage_reader_lease::ReaderScope;
 use crate::entity::{storage_location, storage_reader_lease, upload};
 
@@ -135,7 +135,7 @@ pub struct OrphanedStorageSummary {
 /// authorizes, once its newest object is older than the grace period.
 pub async fn reconcile_orphaned_storage(
     db: &DatabaseConnection,
-    storage: &FsStorage,
+    storage: &Backend,
     grace_period_hours: u64,
     now: DateTime<Utc>,
 ) -> Result<OrphanedStorageSummary, (OrphanedStorageSummary, anyhow::Error)> {

@@ -36,10 +36,15 @@ async fn saves_and_restores_payloads_of_all_sizes() {
         );
     }
 
-    let merged = std::fs::read_dir(server.storage_path())
-        .unwrap()
-        .filter(|entry| entry.as_ref().unwrap().path().join("merged").exists())
-        .count();
+    let mut merged = 0;
+    for folder in server.storage_folders().await {
+        if server
+            .object_exists(&format!("{}/merged", folder.folder_name))
+            .await
+        {
+            merged += 1;
+        }
+    }
     assert_eq!(merged, 4);
 }
 
@@ -172,7 +177,7 @@ async fn saving_an_existing_key_replaces_the_entry() {
         .await
         .unwrap();
     assert_eq!(summary.deleted_locations, Some(1));
-    assert_eq!(std::fs::read_dir(server.storage_path()).unwrap().count(), 1);
+    assert_eq!(server.storage_folders().await.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -26,6 +26,9 @@ io-uring = ["dep:tokio-uring", "dep:io-uring"]
 anyhow = "1"
 async-stream = "0.3"
 async-trait = "0.1"
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "credentials-process"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-ring"] }
 axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"
 bytes = "1"

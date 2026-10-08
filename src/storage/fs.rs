@@ -10,44 +10,10 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::Stream;
 
+use super::backend::{
+    FilesystemUsage, StorageDeletion, StorageError, StorageFolder, StorageObject,
+};
 use super::io::{ByteStream, FileIo, blocking};
-
-#[derive(Debug, thiserror::Error)]
-pub enum StorageError {
-    #[error("Object not found in storage: {0}")]
-    NotFound(String),
-    #[error("Invalid object name `{0}`")]
-    InvalidName(String),
-    #[error(transparent)]
-    Io(#[from] io::Error),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StorageObject {
-    pub name: String,
-    pub bytes: u64,
-}
-
-#[derive(Clone, Debug)]
-pub struct StorageFolder {
-    pub folder_name: String,
-    pub object_count: u64,
-    pub bytes: u64,
-    /// Newest modification time of the folder or anything inside it.
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct StorageDeletion {
-    pub objects: u64,
-    pub bytes: u64,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct FilesystemUsage {
-    pub capacity_bytes: u64,
-    pub used_bytes: u64,
-}
 
 #[derive(Clone)]
 pub struct FsStorage {
@@ -199,10 +165,6 @@ impl FsStorage {
             Ok(objects)
         })
         .await?)
-    }
-
-    pub async fn count_files(&self, folder: &str) -> Result<usize, StorageError> {
-        Ok(self.list_folder(folder).await?.len())
     }
 
     /// Inventory of every top-level entry under the root.

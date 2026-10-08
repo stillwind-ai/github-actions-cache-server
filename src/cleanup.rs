@@ -189,7 +189,7 @@ impl Cleanup {
         errors: &mut Vec<anyhow::Error>,
         folder: &str,
     ) {
-        match self.storage.fs().delete_folder(folder).await {
+        match self.storage.backend().delete_folder(folder).await {
             Ok(deleted) => {
                 Summary::add(&mut summary.deleted_objects, deleted.objects);
                 Summary::add(&mut summary.deleted_bytes, deleted.bytes);
@@ -363,7 +363,7 @@ impl Cleanup {
                 }
                 match self
                     .storage
-                    .fs()
+                    .backend()
                     .delete_folder(&format!("{folder_name}/parts"))
                     .await
                 {
@@ -437,7 +437,7 @@ impl Cleanup {
     async fn orphaned_storage(&self, summary: &mut Summary) -> anyhow::Result<()> {
         let result = reconcile_orphaned_storage(
             &self.db,
-            self.storage.fs(),
+            self.storage.backend(),
             self.config.orphaned_storage_grace_period_hours,
             Utc::now(),
         )

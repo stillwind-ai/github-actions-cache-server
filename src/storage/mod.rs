@@ -1,10 +1,13 @@
 //! The cache storage engine: Uploads, Cache Entries, Storage Locations and
-//! their Merge, on filesystem storage with Postgres as the source of truth.
+//! their Merge, on filesystem or S3 storage with Postgres as the source of
+//! truth.
 
+pub mod backend;
 pub mod fs;
 pub mod io;
 pub mod leases;
 pub mod lifecycle;
+pub mod s3;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -24,7 +27,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
-use self::fs::{FsStorage, StorageError};
+use self::backend::{Backend, StorageError};
 use self::io::ByteStream;
 use self::leases::LEASE_RENEWAL;
 use self::lifecycle::{delete_storage_location_if_unread, no_active_reader_lease};
@@ -36,6 +39,11 @@ use crate::entity::{cache_entry, merge_lease, storage_location, upload};
 /// Bounds the self-heal retry when matching keeps surfacing Dangling Cache
 /// Entries for the same prefix (ADR-0005).
 const MAX_DANGLING_PURGE_ATTEMPTS: usize = 10;
+
+/// Lifetime of a direct-download URL and of the Storage Reader Lease that
+/// protects the object it points at: the server can't observe when a direct
+/// download finishes.
+const DIRECT_DOWNLOAD_LEASE_DURATION: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -88,7 +96,7 @@ pub struct EvictionSummary {
 
 pub struct Storage {
     db: DatabaseConnection,
-    fs: FsStorage,
+    backend: Backend,
     config: Arc<Config>,
     merges: TaskTracker,
 }
@@ -113,10 +121,10 @@ fn escape_like(value: &str) -> String {
 }
 
 /// Streams the Parts of a Storage Location in order, opening each lazily.
-fn stream_parts(fs: FsStorage, folder_name: String, part_count: i32) -> ByteStream {
+fn stream_parts(backend: Backend, folder_name: String, part_count: i32) -> ByteStream {
     Box::pin(async_stream::stream! {
         for index in 0..part_count as u32 {
-            let mut part = match fs.read(&part_name(&folder_name, index)).await {
+            let mut part = match backend.read(&part_name(&folder_name, index)).await {
                 Ok(part) => part,
                 Err(err) => {
                     yield Err(std::io::Error::other(err));
@@ -135,17 +143,17 @@ fn stream_parts(fs: FsStorage, folder_name: String, part_count: i32) -> ByteStre
 }
 
 impl Storage {
-    pub fn new(db: DatabaseConnection, fs: FsStorage, config: Arc<Config>) -> Self {
+    pub fn new(db: DatabaseConnection, backend: Backend, config: Arc<Config>) -> Self {
         Self {
             db,
-            fs,
+            backend,
             config,
             merges: TaskTracker::new(),
         }
     }
 
-    pub fn fs(&self) -> &FsStorage {
-        &self.fs
+    pub fn backend(&self) -> &Backend {
+        &self.backend
     }
 
     pub fn db(&self) -> &DatabaseConnection {
@@ -221,7 +229,7 @@ impl Storage {
             .exec(&self.db)
             .await?;
 
-        self.fs
+        self.backend
             .write(&part_name(&folder_name, index), body, None)
             .await?;
 
@@ -242,7 +250,7 @@ impl Storage {
         if let Err(err) = upload::Entity::delete_by_id(upload.id).exec(&self.db).await {
             return err.into();
         }
-        if let Err(err) = self.fs.delete_folder(&upload.folder_name).await {
+        if let Err(err) = self.backend.delete_folder(&upload.folder_name).await {
             tracing::warn!(upload = upload.id, error = %err, "Failed to delete abandoned upload");
         }
         Error::UploadRejected(reason)
@@ -283,7 +291,7 @@ impl Storage {
         }
 
         let parts = self
-            .fs
+            .backend
             .list_folder(&parts_folder(&upload.folder_name))
             .await?;
         if parts.len() != upload.finished_part_upload_count as usize {
@@ -372,22 +380,48 @@ impl Storage {
         }
 
         if self.config.eager_merge {
-            // Filesystem storage has no Server-side Merge, so an Eager Merge
-            // always streams the Parts (ADR-0009).
-            let fs = self.fs.clone();
-            let folder_name = location.folder_name.clone();
-            let size = location.size_bytes as u64;
-            let parts = stream_parts(fs.clone(), folder_name.clone(), location.part_count);
-            let write = async move {
-                fs.write(&merged_name(&folder_name), parts, Some(size))
-                    .await
-            };
-            if let Err(err) = self.start_merge(&location, write).await {
+            let mut part_sizes: Vec<(u32, u64)> = parts
+                .iter()
+                .filter_map(|part| Some((part.name.parse().ok()?, part.bytes)))
+                .collect();
+            part_sizes.sort_unstable();
+            let part_sizes: Vec<u64> = part_sizes.into_iter().map(|(_, bytes)| bytes).collect();
+            if let Err(err) = self.merge_eagerly(&location, &part_sizes).await {
                 tracing::warn!(error = %err, "Eager Merge failed to start after upload completion");
             }
         }
 
         Ok(Some(upload.id))
+    }
+
+    /// Eager Merge (ADR-0009): a Server-side Merge when the backend can
+    /// compose these Parts, otherwise the streaming merge right away. Only
+    /// the lease acquisition is awaited; the Merge runs in the background.
+    async fn merge_eagerly(
+        &self,
+        location: &storage_location::Model,
+        part_sizes: &[u64],
+    ) -> Result<bool> {
+        let backend = self.backend.clone();
+        let folder_name = location.folder_name.clone();
+        let size = location.size_bytes as u64;
+        if let Some(limits) = backend.compose_limits()
+            && limits.allows(part_sizes)
+        {
+            let part_count = location.part_count as u32;
+            let write = async move {
+                backend.compose_parts(&folder_name, part_count).await?;
+                Ok(size)
+            };
+            return self.start_merge(location, write).await;
+        }
+        let parts = stream_parts(backend.clone(), folder_name.clone(), location.part_count);
+        let write = async move {
+            backend
+                .write(&merged_name(&folder_name), parts, Some(size))
+                .await
+        };
+        self.start_merge(location, write).await
     }
 
     async fn stored_bytes(&self) -> Result<u64> {
@@ -409,11 +443,16 @@ impl Storage {
     /// Capacity-based Eviction (ADR-0008): once usage exceeds the Storage
     /// Budget, deletes Cache Entries in Cache Recency order until usage is at
     /// most 90% of it. Reader leases still protect locations being read.
+    /// Object storage has no capacity, so there it only applies with an
+    /// explicit `CACHE_MAX_SIZE_BYTES`.
     pub async fn enforce_storage_budget(&self) -> Result<EvictionSummary> {
         let mut summary = EvictionSummary::default();
         let filesystem_usage = match self.config.cache_max_size_bytes {
             Some(_) => None,
-            None => Some(self.fs.filesystem_usage().await?),
+            None => match self.backend.filesystem_usage().await? {
+                Some(usage) => Some(usage),
+                None => return Ok(summary),
+            },
         };
         let budget = match (self.config.cache_max_size_bytes, filesystem_usage) {
             (Some(max), _) => max,
@@ -470,11 +509,15 @@ impl Storage {
             if !deleted {
                 continue;
             }
-            let reclaimed = self.fs.delete_folder(&folder_name).await?;
+            let reclaimed = self.backend.delete_folder(&folder_name).await?;
             summary.evicted_locations += 1;
             summary.evicted_bytes += reclaimed.bytes;
             usage = match filesystem_usage {
-                Some(_) => self.fs.filesystem_usage().await?.used_bytes,
+                Some(_) => self
+                    .backend
+                    .filesystem_usage()
+                    .await?
+                    .map_or(usage, |current| current.used_bytes),
                 None => usage.saturating_sub(size_bytes as u64),
             };
         }
@@ -545,28 +588,31 @@ impl Storage {
     ) -> Result<Option<ByteStream>> {
         if location.merged_at.is_some() {
             return Ok(Some(
-                self.fs.read(&merged_name(&location.folder_name)).await?,
+                self.backend
+                    .read(&merged_name(&location.folder_name))
+                    .await?,
             ));
         }
 
         let parts = parts_folder(&location.folder_name);
-        if self.fs.count_files(&parts).await? < location.part_count as usize {
+        if self.backend.count_files(&parts).await? < location.part_count as usize {
             return Err(StorageError::NotFound(parts).into());
         }
 
         let (merger_sender, merger_receiver) = mpsc::channel::<std::io::Result<Bytes>>(2);
-        let fs = self.fs.clone();
+        let backend = self.backend.clone();
         let name = merged_name(&location.folder_name);
         let size = location.size_bytes as u64;
         let write = async move {
-            fs.write(&name, ReceiverStream::new(merger_receiver), Some(size))
+            backend
+                .write(&name, ReceiverStream::new(merger_receiver), Some(size))
                 .await
         };
         if !self.start_merge(location, write).await? {
             // Someone else is merging: read the Parts, which our Part Reader
             // Lease protects until we're done.
             return Ok(Some(stream_parts(
-                self.fs.clone(),
+                self.backend.clone(),
                 location.folder_name.clone(),
                 location.part_count,
             )));
@@ -574,7 +620,7 @@ impl Storage {
 
         let (response_sender, response_receiver) = mpsc::channel::<std::io::Result<Bytes>>(2);
         let parts = stream_parts(
-            self.fs.clone(),
+            self.backend.clone(),
             location.folder_name.clone(),
             location.part_count,
         );
@@ -786,13 +832,61 @@ impl Storage {
                 self.purge_dangling_cache_entry(&entry).await?;
                 continue;
             }
-            return Ok(Some((
-                format!("{}/download/{}", self.config.api_base_url, entry.id),
-                entry,
-            )));
+            let url = match &location {
+                Some(location) if location.merged_at.is_some() => {
+                    self.direct_download_url(location.id).await?
+                }
+                _ => None,
+            };
+            let url = url
+                .unwrap_or_else(|| format!("{}/download/{}", self.config.api_base_url, entry.id));
+            return Ok(Some((url, entry)));
         }
         tracing::warn!("Exhausted Dangling Cache Entry purge attempts; returning cache miss");
         Ok(None)
+    }
+
+    /// With direct downloads enabled, a presigned URL for a merged Storage
+    /// Location's object. The download can't be observed, so it is a Cache
+    /// Access now and a Storage Reader Lease lasting as long as the URL
+    /// protects the object. `None` when direct downloads are off or the
+    /// location is (no longer) merged.
+    async fn direct_download_url(&self, location_id: Uuid) -> Result<Option<String>> {
+        if !self.config.enable_direct_downloads || !self.backend.supports_direct_downloads() {
+            return Ok(None);
+        }
+        let txn = self.db.begin().await?;
+        let Some(location) = storage_location::Entity::find_by_id(location_id)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+        else {
+            return Ok(None);
+        };
+        // The merge could have been undone since the entry was validated.
+        if location.merged_at.is_none() {
+            return Ok(None);
+        }
+        let expires_at = Utc::now()
+            + chrono::Duration::from_std(DIRECT_DOWNLOAD_LEASE_DURATION).expect("small duration");
+        leases::create_reader_lease_until(&txn, location.id, ReaderScope::Storage, expires_at)
+            .await?;
+        storage_location::Entity::update_many()
+            .col_expr(
+                storage_location::Column::LastDownloadedAt,
+                Expr::value(Utc::now()),
+            )
+            .filter(storage_location::Column::Id.eq(location.id))
+            .exec(&txn)
+            .await?;
+        txn.commit().await?;
+        Ok(self
+            .backend
+            .download_url(
+                &merged_name(&location.folder_name),
+                DIRECT_DOWNLOAD_LEASE_DURATION,
+            )
+            .await?)
     }
 
     /// A merged entry is confirmed by its merged object, an unmerged one by
@@ -801,12 +895,18 @@ impl Storage {
     /// and the server never loses individual Parts (ADR-0005).
     async fn storage_has_data(&self, location: &storage_location::Model) -> Result<bool> {
         if location.merged_at.is_some() {
-            return Ok(self.fs.exists(&merged_name(&location.folder_name)).await?);
+            return Ok(self
+                .backend
+                .exists(&merged_name(&location.folder_name))
+                .await?);
         }
         if location.parts_deleted_at.is_some() || location.part_count == 0 {
             return Ok(false);
         }
-        Ok(self.fs.exists(&part_name(&location.folder_name, 0)).await?)
+        Ok(self
+            .backend
+            .exists(&part_name(&location.folder_name, 0))
+            .await?)
     }
 
     async fn purge_dangling_cache_entry(&self, entry: &cache_entry::Model) -> Result<()> {

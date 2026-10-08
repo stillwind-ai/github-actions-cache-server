@@ -54,13 +54,46 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
 
+  test-s3:
+    name: 🧪 Tests (S3)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+      rustfs:
+        image: rustfs/rustfs:1.0.0-glibc
+        env:
+          RUSTFS_ACCESS_KEY: access_key
+          RUSTFS_SECRET_KEY: secret_key
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "curl -fsS http://localhost:9000/health" --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      TEST_STORAGE_DRIVER: s3
+      TEST_S3_ENDPOINT: http://localhost:9000
+      TEST_S3_ACCESS_KEY_ID: access_key
+      TEST_S3_SECRET_ACCESS_KEY: secret_key
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
   deploy:
     if: github.event.ref == 'refs/heads/dev'
     name: 🚀 Build and push
     permissions:
       packages: write
       contents: read
-    needs: [lint, test]
+    needs: [lint, test, test-s3]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

@@ -86,12 +86,23 @@ pub async fn create_reader_lease(
     storage_location_id: Uuid,
     scope: ReaderScope,
 ) -> Result<Uuid, DbErr> {
+    create_reader_lease_until(db, storage_location_id, scope, lease_expiry(Utc::now())).await
+}
+
+/// A Storage Reader Lease that expires at a fixed time and is never renewed,
+/// e.g. for a direct download the server cannot observe.
+pub async fn create_reader_lease_until(
+    db: &impl ConnectionTrait,
+    storage_location_id: Uuid,
+    scope: ReaderScope,
+    expires_at: DateTime<Utc>,
+) -> Result<Uuid, DbErr> {
     let id = Uuid::new_v4();
     storage_reader_lease::Entity::insert(storage_reader_lease::ActiveModel {
         id: Set(id),
         storage_location_id: Set(storage_location_id),
         scope: Set(scope),
-        expires_at: Set(lease_expiry(Utc::now())),
+        expires_at: Set(expires_at),
     })
     .exec_without_returning(db)
     .await?;

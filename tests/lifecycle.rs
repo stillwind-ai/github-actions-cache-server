@@ -147,12 +147,13 @@ async fn parts_are_deleted_after_the_merge_unless_a_part_reader_holds_them() {
     assert_eq!(summary.deleted_parts, Some(3));
     let location = location_of(&server, "parts").await;
     assert!(location.parts_deleted_at.is_some());
-    assert!(
-        !server
-            .storage_path()
-            .join(&location.folder_name)
-            .join("parts")
-            .exists()
+    assert_eq!(
+        server
+            .backend()
+            .count_files(&format!("{}/parts", location.folder_name))
+            .await
+            .unwrap(),
+        0
     );
     assert!(server.restore("parts", "v1").await == data);
 
@@ -183,14 +184,9 @@ async fn concurrent_first_downloads_all_get_the_payload() {
         assert!(body == data);
     }
     server.wait_for_merges().await;
-    let merged = std::fs::read(
-        server
-            .storage_path()
-            .join(location_of(&server, "concurrent").await.folder_name)
-            .join("merged"),
-    )
-    .unwrap();
-    assert!(merged == data);
+    let folder = location_of(&server, "concurrent").await.folder_name;
+    let merged = server.read_object(&format!("{folder}/merged")).await;
+    assert!(merged.unwrap() == data);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -219,15 +215,31 @@ async fn eager_merge_merges_at_upload_completion() {
     let location = location_of(&server, "eager").await;
     assert!(location.merged_at.is_some());
     assert!(location.last_downloaded_at.is_none());
-    let merged = std::fs::read(
-        server
-            .storage_path()
-            .join(&location.folder_name)
-            .join("merged"),
-    )
-    .unwrap();
-    assert!(merged == data);
+    let merged = server
+        .read_object(&format!("{}/merged", location.folder_name))
+        .await;
+    assert!(merged.unwrap() == data);
     assert!(server.restore("eager", "v1").await == data);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn eager_merge_of_large_parts_composes_them() {
+    const MB: usize = 1024 * 1024;
+    let server = start_with(&[("EAGER_MERGE", "true")]).await;
+    // Every Part but the last is at least 5 MiB, so object storage merges
+    // them server-side (ADR-0009); the filesystem streams them.
+    let data = random_bytes(12 * MB + 17);
+    server.save("composed", "v1", &data, 6 * MB).await;
+    server.wait_for_merges().await;
+
+    let location = location_of(&server, "composed").await;
+    assert_eq!(location.part_count, 3);
+    assert!(location.merged_at.is_some());
+    let merged = server
+        .read_object(&format!("{}/merged", location.folder_name))
+        .await;
+    assert!(merged.unwrap() == data);
+    assert!(server.restore("composed", "v1").await == data);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -238,7 +250,7 @@ async fn dangling_cache_entries_are_purged_and_matching_falls_back() {
 
     // External mutation: the newest entry's data disappears.
     let folder = location_of(&server, "deps-new").await.folder_name;
-    std::fs::remove_dir_all(server.storage_path().join(folder)).unwrap();
+    server.remove_folder(&folder).await;
 
     let (url, matched) = server.lookup("deps-", &[], "v1").await.unwrap();
     assert_eq!(matched, "deps-old");
@@ -254,7 +266,7 @@ async fn dangling_cache_entries_are_purged_and_matching_falls_back() {
 
     // An exact lookup of a dangling entry is a clean miss.
     let folder = location_of(&server, "deps-old").await.folder_name;
-    std::fs::remove_dir_all(server.storage_path().join(folder)).unwrap();
+    server.remove_folder(&folder).await;
     assert!(server.lookup("deps-old", &[], "v1").await.is_none());
     assert_eq!(entry_count(&server).await, 0);
 }
@@ -269,7 +281,7 @@ async fn merged_entries_are_validated_by_their_merged_object() {
     server.state.cleanup.run(Task::Parts).await.unwrap();
 
     let folder = location_of(&server, "merged").await.folder_name;
-    std::fs::remove_file(server.storage_path().join(folder).join("merged")).unwrap();
+    server.remove_object(&format!("{folder}/merged")).await;
     assert!(server.lookup("merged", &[], "v1").await.is_none());
     assert_eq!(entry_count(&server).await, 0);
 }
@@ -280,7 +292,7 @@ async fn downloads_of_vanished_data_are_404s() {
     server.save("vanishing", "v1", b"data", 1024).await;
     let (url, _) = server.lookup("vanishing", &[], "v1").await.unwrap();
     let folder = location_of(&server, "vanishing").await.folder_name;
-    std::fs::remove_dir_all(server.storage_path().join(folder)).unwrap();
+    server.remove_folder(&folder).await;
 
     assert_eq!(server.download(&url).await.0, 404);
     wait_for_no_reader_leases(&server).await;
@@ -296,6 +308,10 @@ async fn downloads_of_vanished_data_are_404s() {
 #[tokio::test(flavor = "multi_thread")]
 async fn reconciles_orphaned_storage_after_the_grace_period() {
     let server = start().await;
+    if server.is_s3() {
+        // Object modification times can't be set; see the test below.
+        return;
+    }
     server.save("authorized", "v1", b"kept", 1024).await;
     server.create_entry("in-progress", "v1").await.unwrap();
 
@@ -338,6 +354,44 @@ async fn reconciles_orphaned_storage_after_the_grace_period() {
     );
     assert!(!root.join("orphan-old").exists());
     assert!(root.join("orphan-fresh").exists());
+    assert_eq!(server.restore("authorized", "v1").await, b"kept");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn orphaned_storage_ages_by_its_newest_object() {
+    use cache_server::storage::lifecycle::reconcile_orphaned_storage;
+
+    let server = start().await;
+    server.save("authorized", "v1", b"kept", 1024).await;
+    server.put_object("orphan/parts/0", b"12345").await;
+    server.put_object("orphan/parts/1", b"678").await;
+
+    let reconcile = |hours_from_now: i64| {
+        reconcile_orphaned_storage(
+            server.state.storage.db(),
+            server.backend(),
+            24,
+            Utc::now() + chrono::Duration::hours(hours_from_now),
+        )
+    };
+    let orphans = reconcile(0).await.unwrap();
+    assert_eq!(orphans.inspected_folders, 2);
+    assert_eq!(orphans.authorized_folders, 1);
+    assert_eq!(orphans.grace_period_folders, 1);
+    assert_eq!(orphans.deleted_folders, 0);
+
+    let orphans = reconcile(25).await.unwrap();
+    assert_eq!(orphans.authorized_folders, 1);
+    assert_eq!(
+        (
+            orphans.deleted_folders,
+            orphans.deleted_objects,
+            orphans.deleted_bytes
+        ),
+        (1, 2, 8)
+    );
+    assert!(!server.object_exists("orphan/parts/0").await);
+    assert_eq!(server.storage_folders().await.len(), 1);
     assert_eq!(server.restore("authorized", "v1").await, b"kept");
 }
 

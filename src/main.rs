@@ -59,7 +59,8 @@ async fn bind(addrs: &[std::net::SocketAddr]) -> anyhow::Result<tokio::net::TcpL
 
 fn init_tracing(debug: bool) {
     let default = if debug {
-        "debug,sqlx=info,sqlx::postgres::notice=warn,hyper=info,h2=info"
+        // `aws` covers every AWS SDK crate (aws_sdk_s3, aws_smithy_*, ...).
+        "debug,sqlx=info,sqlx::postgres::notice=warn,hyper=info,h2=info,aws=info,rustls=info"
     } else {
         "info,sqlx::postgres::notice=warn"
     };
