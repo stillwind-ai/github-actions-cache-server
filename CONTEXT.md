@@ -8,7 +8,7 @@ This context describes the cache data managed by the server throughout its lifec
 A cache item available for matching and restoration by a workflow.
 
 **Storage Budget**:
-The maximum amount of cache-server-managed, finalized cache payloads that may occupy storage before capacity-based eviction reclaims space. An explicit byte-based maximum may define it for any storage backend; otherwise it is a configurable percentage of the filesystem capacity, defaulting to 90%. Object-storage backends have no budget unless an explicit maximum is configured.
+The maximum amount of cache-server-managed, finalized cache payloads that may occupy storage before capacity-based eviction reclaims space. An explicit byte-based maximum may define it; otherwise, on filesystem storage, it is a configurable percentage of the filesystem capacity, defaulting to 90%. Object storage without an explicit maximum has no Storage Budget.
 _Avoid_: Storage limit, disk limit
 
 **Filesystem Capacity**:
@@ -19,12 +19,8 @@ _Avoid_: Cache directory size
 Removal of finalized cache entries after an upload completes to bring cache storage within its Storage Budget, ordered by Cache Recency. Each eviction pass reclaims space until use is 90% of the budget.
 _Avoid_: Cache rotation, cleanup at X%
 
-**Storage Reconciliation**:
-A resumable, one-time startup measurement that records byte usage for stored cache data predating size tracking.
-_Avoid_: Size backfill, bucket scan
-
 **Cache Access**:
-Authorization to retrieve a cache payload, either by starting a proxied download or issuing a direct-download URL. It determines a cache payload's recency even when completion cannot be observed.
+Authorization to retrieve a cache payload by starting a download. It determines a cache payload's recency even when completion cannot be observed.
 _Avoid_: Successful download
 
 **Cache Recency**:
@@ -47,10 +43,6 @@ The creation of a cache's consolidated stored representation from its Parts.
 A Merge started at upload completion instead of on first download. Opt-in via `EAGER_MERGE`.
 _Avoid_: pre-merge, upfront merge
 
-**Server-side Merge**:
-A Merge the storage backend performs by copying Parts into the merged object without their bytes passing through the server (S3 `UploadPartCopy`). Requires every Part to satisfy the backend's limits.
-_Avoid_: server-side copy
-
 **Merge Lease**:
 A time-bound, fenced claim granting one worker authority to complete a Merge.
 
@@ -65,7 +57,7 @@ Stored cache data that, after a safety grace period, belongs to neither an Uploa
 _Avoid_: Orphan blob, orphaned storage location
 
 **Dangling Cache Entry**:
-A Cache Entry whose Storage Location references storage that no longer physically exists, caused by external mutation of storage the server owns (bucket wipe, external lifecycle expiry, out-of-sync database restore). The mirror of Orphaned Storage.
+A Cache Entry whose Storage Location references storage that no longer physically exists, caused by external mutation of storage the server owns (deleted files, out-of-sync database restore). The mirror of Orphaned Storage.
 _Avoid_: stale entry, missing cache
 
 **Cache Hit**:

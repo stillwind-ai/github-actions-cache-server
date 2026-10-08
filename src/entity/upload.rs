@@ -1,0 +1,21 @@
+use sea_orm::entity::prelude::*;
+
+/// Cache data that is being received but has not yet become a Cache Entry.
+#[sea_orm::model]
+#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+#[sea_orm(table_name = "uploads")]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub id: i64,
+    pub repo_id: String,
+    pub scope: String,
+    pub version: String,
+    pub key: String,
+    pub folder_name: String,
+    pub created_at: DateTimeUtc,
+    pub last_part_uploaded_at: Option<DateTimeUtc>,
+    pub started_part_upload_count: i32,
+    pub finished_part_upload_count: i32,
+}
+
+impl ActiveModelBehavior for ActiveModel {}

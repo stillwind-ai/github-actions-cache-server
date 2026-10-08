@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:15
+    image: postgres:17
     ports:
       - 5432:5432
     environment:
@@ -8,14 +8,8 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: postgres
 
-  # mysql:
-  #   image: mysql:8
-  #   ports:
-  #     - 3306:3306
-  #   environment:
-  #     MYSQL_ROOT_PASSWORD: root
-  #     MYSQL_DATABASE: mysql
-
+  # S3-compatible storage for STORAGE_DRIVER=s3 (and the S3 test suite:
+  # TEST_STORAGE_DRIVER=s3 cargo test).
   rustfs:
     image: rustfs/rustfs:1.0.0-glibc
     ports:
@@ -40,14 +34,23 @@ services:
   #   ports:
   #     - '3000:3000'
   #   depends_on:
-  #     - rustfs
-
+  #     - postgres
+  #   # The default Docker seccomp profile blocks io_uring; the server then
+  #   # falls back to regular file I/O. To allow io_uring:
+  #   # security_opt:
+  #   #   - seccomp=unconfined
   #   environment:
   #     API_BASE_URL: http://localhost:3000
+  #     STORAGE_FILESYSTEM_PATH: /data/cache
+  #     DB_POSTGRES_URL: postgres://postgres:postgres@postgres:5432/postgres
+  #     # Or store cache data in the RustFS bucket above:
+  #     # STORAGE_DRIVER: s3
+  #     # STORAGE_S3_BUCKET: test
+  #     # AWS_ACCESS_KEY_ID: access_key
+  #     # AWS_SECRET_ACCESS_KEY: secret_key
+  #     # AWS_ENDPOINT_URL: http://rustfs:9000
+  #   volumes:
+  #     - cache-data:/data
 
-  #     STORAGE_DRIVER: s3
-  #     STORAGE_S3_BUCKET: test
-
-  #     AWS_ACCESS_KEY_ID: access_key
-  #     AWS_SECRET_ACCESS_KEY: secret_key
-  #     AWS_ENDPOINT_URL: http://rustfs:9000
+# volumes:
+#   cache-data:
