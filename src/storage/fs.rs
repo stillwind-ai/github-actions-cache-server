@@ -394,7 +394,7 @@ mod tests {
                 }
             ]
         );
-        assert!(storage.list_folder("missing").await.unwrap().is_empty());
+        assert_eq!(storage.list_folder("missing").await.unwrap(), []);
 
         // No temp entries are left behind.
         let folders = storage.list_storage_folders().await.unwrap();
