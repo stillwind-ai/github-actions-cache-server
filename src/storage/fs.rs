@@ -206,10 +206,16 @@ impl FsStorage {
         Ok(result?)
     }
 
-    /// # Errors
-    ///
-    /// [`StorageError::InvalidName`] for a name outside the storage root, or the
-    /// underlying I/O error.
+    /// Atomically renames an object; a missing source is `NotFound`.
+    pub async fn rename(&self, from: &str, to: &str) -> Result<(), StorageError> {
+        match self.io.rename(self.path(from)?, self.path(to)?).await {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                Err(StorageError::NotFound(from.to_owned()))
+            }
+            result => Ok(result?),
+        }
+    }
+
     pub async fn exists(&self, name: &str) -> Result<bool, StorageError> {
         Ok(self.io.file_size(self.path(name)?).await?.is_some())
     }

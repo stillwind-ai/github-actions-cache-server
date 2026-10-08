@@ -13,11 +13,10 @@ use bytes::Bytes;
 use chrono::Utc;
 use futures::{Stream, StreamExt};
 use rand::Rng;
-use sea_orm::sea_query::{CaseStatement, Expr, Func, LikeExpr, LockType, OnConflict, Query};
+use sea_orm::sea_query::{CaseStatement, Expr, Func, LikeExpr, OnConflict, Query};
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, Condition, DatabaseConnection, DbErr, EntityTrait, ExprTrait,
-    JoinType, Order, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait,
-    TransactionTrait,
+    JoinType, Order, QueryFilter, QueryOrder, QuerySelect, RelationTrait, TransactionTrait,
 };
 use serde::Serialize;
 use tokio::sync::oneshot;
@@ -30,7 +29,6 @@ use self::leases::LEASE_RENEWAL;
 use self::lifecycle::{delete_storage_location_if_unread, no_active_reader_lease};
 use crate::config::Config;
 use crate::db::retry_on_lock_conflict;
-use crate::entity::storage_reader_lease::ReaderScope;
 use crate::entity::{cache_entry, merge_lease, storage_location, upload};
 
 /// Bounds the self-heal retry when matching keeps surfacing Dangling Cache
@@ -336,15 +334,18 @@ impl Storage {
         }
 
         let now = Utc::now();
+        // A single Part already is the merged object: it is renamed into
+        // place below instead of being copied by a Merge.
+        let merged = (parts.len() == 1).then_some(now);
         let location = storage_location::ActiveModel {
             id: Set(Uuid::new_v4()),
             folder_name: Set(upload.folder_name.clone()),
             part_count: Set(upload.finished_part_upload_count),
             size_bytes: Set(parts.iter().map(|part| part.bytes.cast_signed()).sum()),
             created_at: Set(now),
-            merge_started_at: Set(None),
-            merged_at: Set(None),
-            parts_deleted_at: Set(None),
+            merge_started_at: Set(merged),
+            merged_at: Set(merged),
+            parts_deleted_at: Set(merged),
             last_downloaded_at: Set(None),
         };
 
@@ -356,6 +357,17 @@ impl Storage {
         let claimed = upload::Entity::delete_by_id(upload.id).exec(&txn).await?;
         if claimed.rows_affected != 1 {
             return Ok(None);
+        }
+        // Before the commit, so the location never names a missing object
+        // (which a lookup would purge as dangling, ADR-0005). The Upload is
+        // claimed, so no one else reads or renames its Part.
+        if merged.is_some() {
+            self.fs
+                .rename(
+                    &part_name(&upload.folder_name, 0),
+                    &merged_name(&upload.folder_name),
+                )
+                .await?;
         }
         let location = storage_location::Entity::insert(location)
             .exec_with_returning(&txn)
@@ -399,6 +411,7 @@ impl Storage {
         }
 
         if self.config.eager_merge
+            && merged.is_none()
             && let Err(err) = self.start_merge(&location).await
         {
             tracing::warn!(error = %err, "Eager Merge failed to start after upload completion");
@@ -515,36 +528,11 @@ impl Storage {
     ///
     /// If the database or storage fails. Missing data is `Ok(None)`, not an error.
     pub async fn download(&self, cache_entry_id: Uuid) -> Result<Option<Download>> {
-        // The reader's lease scope is chosen in the same locked transaction
-        // that reads the merge state (ADR-0002).
-        let txn = self.db.begin().await?;
-        let mut query = storage_location::Entity::find()
-            .join(
-                JoinType::InnerJoin,
-                storage_location::Relation::CacheEntry.def(),
-            )
-            .filter(cache_entry::Column::Id.eq(cache_entry_id));
-        QueryTrait::query(&mut query)
-            .lock_with_tables(LockType::Update, [storage_location::Entity]);
-        let Some(location) = query.one(&txn).await? else {
+        let Some((location, lease_id)) =
+            leases::lease_for_download(&self.db, cache_entry_id).await?
+        else {
             return Ok(None);
         };
-        let scope = if location.merged_at.is_some() {
-            ReaderScope::Storage
-        } else {
-            ReaderScope::Parts
-        };
-        let lease_id = leases::create_reader_lease(&txn, location.id, scope).await?;
-        // A Cache Access, for Cache Recency, on the row already locked.
-        storage_location::Entity::update_many()
-            .col_expr(
-                storage_location::Column::LastDownloadedAt,
-                Expr::value(Utc::now()),
-            )
-            .filter(storage_location::Column::Id.eq(location.id))
-            .exec(&txn)
-            .await?;
-        txn.commit().await?;
 
         match self.open_location(&location).await {
             Ok(Some(stream)) => Ok(Some(Download {
