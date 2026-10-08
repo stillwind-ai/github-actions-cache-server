@@ -254,14 +254,21 @@ impl Storage {
     }
 
     /// Database state first, then storage (ADR-0001).
-    async fn abandon_upload(&self, upload: &upload::Model, reason: String) -> Error {
-        if let Err(err) = upload::Entity::delete_by_id(upload.id).exec(&self.db).await {
-            return err.into();
+    /// Like a completion, an abandonment claims the Upload first: a
+    /// concurrent finalization may already have turned it into a Storage
+    /// Location (and renamed its only Part, so the Parts look missing), and
+    /// then its folder holds live data. `Ok(None)` when it was claimed.
+    async fn abandon_upload(&self, upload: &upload::Model, reason: String) -> Result<Option<i64>> {
+        let claimed = upload::Entity::delete_by_id(upload.id)
+            .exec(&self.db)
+            .await?;
+        if claimed.rows_affected != 1 {
+            return Ok(None);
         }
         if let Err(err) = self.fs.delete_folder(&upload.folder_name).await {
             tracing::warn!(upload = upload.id, error = %err, "Failed to delete abandoned upload");
         }
-        Error::UploadRejected(reason)
+        Err(Error::UploadRejected(reason))
     }
 
     /// Turns a finished Upload into a Cache Entry, replacing an existing entry
@@ -295,16 +302,16 @@ impl Storage {
         };
 
         if upload.finished_part_upload_count == 0 {
-            return Err(self
+            return self
                 .abandon_upload(&upload, "No parts have been uploaded".into())
-                .await);
+                .await;
         }
         if upload.started_part_upload_count != upload.finished_part_upload_count {
             let reason = format!(
                 "Not all parts have been uploaded (only {} of {} parts uploaded)",
                 upload.finished_part_upload_count, upload.started_part_upload_count
             );
-            return Err(self.abandon_upload(&upload, reason).await);
+            return self.abandon_upload(&upload, reason).await;
         }
 
         let parts = self
@@ -317,7 +324,7 @@ impl Storage {
                 upload.finished_part_upload_count,
                 parts.len()
             );
-            return Err(self.abandon_upload(&upload, reason).await);
+            return self.abandon_upload(&upload, reason).await;
         }
         // Downloads read parts 0..n-1, so anything else would be a broken entry.
         let indices: BTreeSet<usize> = parts
@@ -325,12 +332,12 @@ impl Storage {
             .filter_map(|part| part.name.parse().ok())
             .collect();
         if !indices.iter().copied().eq(0..parts.len()) {
-            return Err(self
+            return self
                 .abandon_upload(
                     &upload,
                     "Uploaded parts are not numbered contiguously from 0".into(),
                 )
-                .await);
+                .await;
         }
 
         let now = Utc::now();
