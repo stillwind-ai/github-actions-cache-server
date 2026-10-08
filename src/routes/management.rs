@@ -82,7 +82,7 @@ async fn require_api_key(State(state): State<AppState>, request: Request, next: 
     let provided = request
         .headers()
         .get("x-api-key")
-        .map(|value| value.as_bytes());
+        .map(axum::http::HeaderValue::as_bytes);
     // Constant-time comparison: the key is the API's only credential.
     let authorized = provided.is_some_and(|provided| {
         provided.len() == expected.len()
@@ -236,6 +236,14 @@ async fn get_cache_entry(State(state): State<AppState>, Path(id): Path<String>) 
 }
 
 async fn match_cache_entry(State(state): State<AppState>, RawQuery(query): RawQuery) -> Response {
+    #[derive(Serialize)]
+    struct Matched {
+        #[serde(rename = "match")]
+        entry: CacheEntryJson,
+        #[serde(rename = "type")]
+        match_type: MatchType,
+    }
+
     let params = Params::parse(query);
     let (Some(primary_key), Some(repo_id), Some(version)) = (
         params.one("primaryKey"),
@@ -249,14 +257,6 @@ async fn match_cache_entry(State(state): State<AppState>, RawQuery(query): RawQu
         return bad_request("scopes is required");
     }
     let restore_keys = params.all("restoreKeys");
-
-    #[derive(Serialize)]
-    struct Matched {
-        #[serde(rename = "match")]
-        entry: CacheEntryJson,
-        #[serde(rename = "type")]
-        match_type: MatchType,
-    }
 
     let matched = state
         .storage
@@ -282,7 +282,7 @@ async fn find_cache_entries(State(state): State<AppState>, RawQuery(query): RawQ
     let params = Params::parse(query);
     let (items_per_page, page) = match (
         params.integer("itemsPerPage", 20, 1..=100),
-        params.integer("page", 1, 1..=u32::MAX as u64),
+        params.integer("page", 1, 1..=u64::from(u32::MAX)),
     ) {
         (Ok(items_per_page), Ok(page)) => (items_per_page, page),
         (Err(response), _) | (_, Err(response)) => return response,

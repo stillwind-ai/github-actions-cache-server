@@ -19,6 +19,10 @@ use crate::entity::{storage_location, storage_reader_lease, upload};
 
 /// Row-locks a Storage Location for the rest of the transaction. False when
 /// it no longer exists.
+///
+/// # Errors
+///
+/// If the database query fails.
 pub async fn lock_storage_location(db: &impl ConnectionTrait, id: Uuid) -> Result<bool, DbErr> {
     let locked = storage_location::Entity::find_by_id(id)
         .select_only()
@@ -46,6 +50,7 @@ async fn has_active_reader_lease(
 
 /// Predicate for queries over `storage_locations`: true when no unexpired
 /// Storage Reader Lease (optionally of one scope) protects the row.
+#[must_use]
 pub fn no_active_reader_lease(scope: Option<ReaderScope>) -> SimpleExpr {
     let mut leases = Query::select();
     leases
@@ -80,6 +85,10 @@ pub fn no_active_reader_lease(scope: Option<ReaderScope>) -> SimpleExpr {
 /// Deletes a Storage Location (cascading to its Cache Entries and leases)
 /// unless a reader holds it. Must run inside a transaction; the physical
 /// folder is deleted by the caller after commit.
+///
+/// # Errors
+///
+/// If the database query fails.
 pub async fn delete_storage_location_if_unread(
     tx: &impl ConnectionTrait,
     storage_location_id: Uuid,
@@ -97,6 +106,10 @@ pub async fn delete_storage_location_if_unread(
 
 /// Marks a merged Storage Location's Parts as deleted unless a Part Reader
 /// Lease protects them. Must run inside a transaction.
+///
+/// # Errors
+///
+/// If the database query fails.
 pub async fn claim_parts_deletion_if_unread(
     tx: &impl ConnectionTrait,
     storage_location_id: Uuid,
@@ -133,6 +146,11 @@ pub struct OrphanedStorageSummary {
 
 /// Deletes top-level storage that neither an Upload nor a Storage Location
 /// authorizes, once its newest object is older than the grace period.
+///
+/// # Errors
+///
+/// If listing storage or the database fails, or a deletion fails; the
+/// summary of what was done so far comes with the error.
 pub async fn reconcile_orphaned_storage(
     db: &DatabaseConnection,
     storage: &FsStorage,
@@ -165,7 +183,8 @@ pub async fn reconcile_orphaned_storage(
     };
 
     let authorized: HashSet<String> = locations.into_iter().chain(uploads).collect();
-    let cutoff = now - chrono::Duration::hours(grace_period_hours as i64);
+    let cutoff =
+        now - chrono::Duration::hours(i64::try_from(grace_period_hours).unwrap_or(i64::MAX));
     summary.inspected_folders = stored.len() as u64;
     let mut orphaned = Vec::new();
     for folder in stored {

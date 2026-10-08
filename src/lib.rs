@@ -31,6 +31,10 @@ pub struct App {
 }
 
 impl App {
+    /// # Errors
+    ///
+    /// If the database can't be connected to or migrated, or the storage root
+    /// can't be set up.
     pub async fn new(config: Config) -> anyhow::Result<Self> {
         let config = Arc::new(config);
 
@@ -82,6 +86,10 @@ impl App {
 
     /// Serves until `signal` resolves, then drains in-flight requests and
     /// waits for background merges.
+    ///
+    /// # Errors
+    ///
+    /// If the HTTP server fails.
     pub async fn serve(
         self,
         listener: tokio::net::TcpListener,
@@ -90,7 +98,7 @@ impl App {
         if self.state.config.disable_cleanup_jobs {
             tracing::info!("Cleanup jobs are disabled");
         } else {
-            cleanup::spawn_scheduler(self.state.cleanup.clone(), self.shutdown.clone());
+            cleanup::spawn_scheduler(&self.state.cleanup, &self.shutdown);
         }
 
         let shutdown = self.shutdown.clone();

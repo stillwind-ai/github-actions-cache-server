@@ -38,8 +38,7 @@ pub async fn results_passthrough(
     let path = request
         .uri()
         .path_and_query()
-        .map(|path| path.as_str())
-        .unwrap_or("/");
+        .map_or("/", axum::http::uri::PathAndQuery::as_str);
     let url = format!("{}{path}", state.config.default_actions_results_url);
     tracing::debug!(method = %request.method(), url, "Proxying unknown path");
 

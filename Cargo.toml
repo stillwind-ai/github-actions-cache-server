@@ -63,3 +63,6 @@ tempfile = "3"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }

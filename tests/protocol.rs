@@ -99,7 +99,7 @@ async fn scopes_and_repositories_isolate_entries() {
 
     // A feature branch reads its own scope first, then main's.
     let feature = token(
-        json!([
+        &json!([
             { "Scope": "refs/heads/main", "Permission": 1 },
             { "Scope": "refs/heads/feature", "Permission": 3 },
         ]),
@@ -151,7 +151,7 @@ async fn scopes_and_repositories_isolate_entries() {
 
     // Another repository sees nothing.
     let other_repo = token(
-        json!([{ "Scope": "refs/heads/main", "Permission": 3 }]),
+        &json!([{ "Scope": "refs/heads/main", "Permission": 3 }]),
         "456",
     );
     assert!(lookup(other_repo).await.is_none());
@@ -286,8 +286,11 @@ async fn enforces_tokens_and_permissions() {
 
     for bad in [
         "not-a-jwt".to_owned(),
-        token(json!([]), "123"),
-        token(json!([{ "Scope": "refs/heads/main", "Permission": 3 }]), ""),
+        token(&json!([]), "123"),
+        token(
+            &json!([{ "Scope": "refs/heads/main", "Permission": 3 }]),
+            "",
+        ),
     ] {
         let response = server
             .twirp_as(&bad, "CreateCacheEntry", body.clone())
@@ -296,7 +299,7 @@ async fn enforces_tokens_and_permissions() {
     }
 
     let read_only = token(
-        json!([{ "Scope": "refs/heads/main", "Permission": 1 }]),
+        &json!([{ "Scope": "refs/heads/main", "Permission": 1 }]),
         "123",
     );
     let response = server
@@ -450,6 +453,7 @@ struct GetResponse {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(clippy::too_many_lines, reason = "one scenario over every endpoint")]
 async fn speaks_protobuf_to_protobuf_clients() {
     let server = start().await;
     let post = |method: &str, body: Vec<u8>| {

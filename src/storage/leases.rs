@@ -25,6 +25,10 @@ fn lease_expiry(now: DateTime<Utc>) -> DateTime<Utc> {
 /// unexpired one. Returns the fencing token on success.
 ///
 /// A single upsert: inserts a fresh lease, or takes over an expired one.
+///
+/// # Errors
+///
+/// If the database query fails.
 pub async fn acquire_merge_lease(
     db: &impl ConnectionTrait,
     storage_location_id: Uuid,
@@ -49,6 +53,9 @@ pub async fn acquire_merge_lease(
     Ok((rows == 1).then_some(token))
 }
 
+/// # Errors
+///
+/// If the database query fails.
 pub async fn renew_merge_lease(
     db: &impl ConnectionTrait,
     storage_location_id: Uuid,
@@ -68,6 +75,9 @@ pub async fn renew_merge_lease(
     Ok(result.rows_affected == 1)
 }
 
+/// # Errors
+///
+/// If the database query fails.
 pub async fn release_merge_lease(
     db: &impl ConnectionTrait,
     storage_location_id: Uuid,
@@ -81,6 +91,9 @@ pub async fn release_merge_lease(
     Ok(())
 }
 
+/// # Errors
+///
+/// If the database query fails.
 pub async fn create_reader_lease(
     db: &impl ConnectionTrait,
     storage_location_id: Uuid,
@@ -98,6 +111,9 @@ pub async fn create_reader_lease(
     Ok(id)
 }
 
+/// # Errors
+///
+/// If the database query fails.
 pub async fn renew_reader_lease(db: &impl ConnectionTrait, id: Uuid) -> Result<bool, DbErr> {
     let now = Utc::now();
     let result = storage_reader_lease::Entity::update_many()
@@ -112,6 +128,9 @@ pub async fn renew_reader_lease(db: &impl ConnectionTrait, id: Uuid) -> Result<b
     Ok(result.rows_affected == 1)
 }
 
+/// # Errors
+///
+/// If the database query fails.
 pub async fn release_reader_lease(db: &impl ConnectionTrait, id: Uuid) -> Result<(), DbErr> {
     // Races cascade deletes of the storage location, which lock rows in the
     // opposite order.
