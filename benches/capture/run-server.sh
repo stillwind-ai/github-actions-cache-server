@@ -30,9 +30,13 @@ proxy_pid=$!
 echo "$server_pid $proxy_pid" >"$dir/pids"
 until curl -sf "http://127.0.0.1:$server_port/health" >/dev/null; do sleep 0.2; done
 # An unsigned runtime token (the server skips signature checks) with write
-# access to refs/heads/main of repository 1.
-payload=$(printf '{"ac":"[{\\"Scope\\":\\"refs/heads/main\\",\\"Permission\\":3}]","repository_id":"1"}' | base64 -w0 | tr '+/' '-_' | tr -d '=')
-token="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.$payload.signature"
+# access to refs/heads/main of repository 1. go-actions-cache (BuildKit) parses
+# it anyway: the signature must be valid base64url and exp/nbf present.
+b64() { base64 -w0 | tr '+/' '-_' | tr -d '='; }
+now=$(date +%s)
+header=$(printf '{"alg":"HS256","typ":"JWT"}' | b64)
+payload=$(printf '{"ac":"[{\\"Scope\\":\\"refs/heads/main\\",\\"Permission\\":3}]","repository_id":"1","nbf":%d,"iat":%d,"exp":%d}' $((now - 60)) $((now - 60)) $((now + 6 * 3600)) | b64)
+token="$header.$payload.$(printf 'unsigned' | b64)"
 cat <<VARS
 # Cache server for capture '$name' (trace: $dir/trace.jsonl)
 export ACTIONS_RESULTS_URL=$proxy_url/

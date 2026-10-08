@@ -343,13 +343,13 @@ impl<'a> Buildkit<'a> {
     }
 
     /// GetCacheEntryDownloadURL with the key as its own restore key.
-    async fn load(&self, key: &str) -> Option<Value> {
+    async fn load(&self, client: &reqwest::Client, key: &str) -> Option<Value> {
         let ctx = self.ctx;
         let found = ctx
             .timed(
                 "lookup",
                 ctx.twirp_json(
-                    &ctx.keep_alive,
+                    client,
                     "GetCacheEntryDownloadURL",
                     json!({ "key": key, "restore_keys": [key], "version": self.version }),
                 ),
@@ -427,14 +427,16 @@ impl<'a> Buildkit<'a> {
         let started = Instant::now();
         for layer in layers {
             let key = Self::blob_key(layer);
-            if self.load(&key).await.is_none() && !self.save(&key, layer.size).await {
+            if self.load(&self.ctx.keep_alive, &key).await.is_none()
+                && !self.save(&key, layer.size).await
+            {
                 return false;
             }
         }
         let prefix = format!("{index}#");
-        let previous = self.load(&prefix).await;
+        let previous = self.load(&self.ctx.keep_alive, &prefix).await;
         // Loaded again to detect a concurrent export.
-        let _ = self.load(&prefix).await;
+        let _ = self.load(&self.ctx.keep_alive, &prefix).await;
         let next = previous
             .and_then(|found| {
                 found["matched_key"]
@@ -452,32 +454,51 @@ impl<'a> Buildkit<'a> {
         saved
     }
 
-    /// `--cache-from type=gha`: the newest index, then every layer it uses,
-    /// `parallel` at a time.
-    pub async fn import(&self, index: &str, layers: &[Layer], parallel: usize) -> bool {
+    /// `--cache-from type=gha`: the newest index, a burst of lookups for
+    /// every layer in the cache chain, then downloads of the layers the build
+    /// needs, four at a time. Each request opens a fresh connection.
+    pub async fn import(&self, index: &str, chain: &[Layer], needed: &[Layer]) -> bool {
+        const LOOKUP_BURST: usize = 11;
+        const DOWNLOADS: usize = 4;
         let ctx = self.ctx;
+        let client = &ctx.no_keep_alive;
         let started = Instant::now();
-        let Some(found) = self.load(&format!("{index}#")).await else {
+        let Some(found) = self.load(client, &format!("{index}#")).await else {
             return false;
         };
         let url = found["signed_download_url"].as_str().unwrap();
         if ctx
-            .timed("download", ctx.download(&ctx.keep_alive, url))
+            .timed("download", ctx.download(client, url))
             .await
             .is_none()
         {
             return false;
         }
-        let downloads: Vec<_> = layers
+        let lookups: Vec<_> = chain
             .iter()
             .map(|layer| async move {
-                let found = self.load(&Self::blob_key(layer)).await?;
-                let url = found["signed_download_url"].as_str()?;
-                ctx.timed("download", ctx.download(&ctx.keep_alive, url))
-                    .await
+                let found = self.load(client, &Self::blob_key(layer)).await?;
+                Some((
+                    layer.digest.clone(),
+                    found["signed_download_url"].as_str()?.to_owned(),
+                ))
             })
             .collect();
-        let complete = bounded(downloads, parallel)
+        let Some(urls) = bounded(lookups, LOOKUP_BURST)
+            .await
+            .into_iter()
+            .collect::<Option<std::collections::HashMap<_, _>>>()
+        else {
+            return false;
+        };
+        let downloads: Vec<_> = needed
+            .iter()
+            .map(|layer| {
+                let url = &urls[&layer.digest];
+                async move { ctx.timed("download", ctx.download(client, url)).await }
+            })
+            .collect();
+        let complete = bounded(downloads, DOWNLOADS)
             .await
             .iter()
             .all(Option::is_some);

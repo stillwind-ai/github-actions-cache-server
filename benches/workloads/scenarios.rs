@@ -71,7 +71,7 @@ pub fn all(quick: bool) -> Vec<Scenario> {
                     .export("index-buildkit-1-abcdef01", &layers, 2 * KIB)
                     .await;
                 buildkit
-                    .import("index-buildkit-1-abcdef01", &layers, 3)
+                    .import("index-buildkit-1-abcdef01", &layers, &layers)
                     .await;
                 let sccache = Sccache { ctx };
                 let units: Vec<_> = (0..4)

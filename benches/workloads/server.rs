@@ -38,6 +38,22 @@ impl Server {
             .unwrap();
         let mut database_url = url::Url::parse(&admin_url).unwrap();
         database_url.set_path(&database);
+        // `BENCH_DB_RTT_MS` puts the database that many milliseconds away.
+        if let Some(rtt) = std::env::var("BENCH_DB_RTT_MS")
+            .ok()
+            .and_then(|rtt| rtt.parse::<f64>().ok())
+            .filter(|rtt| *rtt > 0.0)
+        {
+            let upstream = format!(
+                "{}:{}",
+                database_url.host_str().unwrap(),
+                database_url.port().unwrap_or(5432)
+            );
+            let proxy =
+                crate::latency::start(upstream, Duration::from_secs_f64(rtt / 1000.0)).await;
+            database_url.set_host(Some("127.0.0.1")).unwrap();
+            database_url.set_port(Some(proxy.port())).unwrap();
+        }
 
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
