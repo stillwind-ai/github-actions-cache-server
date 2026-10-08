@@ -110,7 +110,7 @@ async fn match_priority_outranks_recency() {
 
     // The branch's own scope, even by prefix, beats main's exact key.
     let feature = token(
-        json!([
+        &json!([
             { "Scope": "refs/heads/main", "Permission": 1 },
             { "Scope": "refs/heads/feature", "Permission": 3 },
         ]),

@@ -4,8 +4,8 @@
 //! (open, read, write, close, statx, rename, unlink, mkdir) run on a small pool
 //! of `tokio-uring` worker threads, each owning its own ring and current-thread
 //! runtime; the multi-threaded server runtime hands them jobs over channels.
-//! Operations io_uring has no opcode for (readdir, statvfs, recursive delete,
-//! copy_file_range) run on tokio's blocking pool. When io_uring is disabled or
+//! Operations `io_uring` has no opcode for (readdir, statvfs, recursive delete,
+//! `copy_file_range`) run on tokio's blocking pool. When `io_uring` is disabled or
 //! the kernel refuses a ring at startup, file data moves through `std::fs` on
 //! tokio's blocking pool and metadata operations through `tokio::fs`.
 //!
@@ -30,7 +30,7 @@ const MAX_BATCH_BUFFERS: usize = 64;
 
 /// The next read's size: a whole chunk, or what is left of a `size`-byte file.
 fn chunk_len(size: u64, position: u64) -> usize {
-    size.saturating_sub(position).min(CHUNK_SIZE as u64) as usize
+    usize::try_from(size.saturating_sub(position)).map_or(CHUNK_SIZE, |left| left.min(CHUNK_SIZE))
 }
 
 #[derive(Clone)]
@@ -41,7 +41,7 @@ pub enum FileIo {
 }
 
 impl FileIo {
-    /// io_uring when requested and available, otherwise blocking I/O on
+    /// `io_uring` when requested and available, otherwise blocking I/O on
     /// tokio's blocking pool.
     pub fn new(use_io_uring: bool, threads: usize) -> Self {
         if !use_io_uring {
@@ -269,7 +269,7 @@ fn read_blocking(file: std::fs::File, size: u64) -> ByteStream {
         let mut position = 0;
         let mut next = (size > 0).then(|| read(file, 0));
         while let Some(pending) = next.take() {
-            let (file, chunk) = pending.await.map_err(join_error)??;
+            let (file, chunk) = pending.await.map_err(|err| join_error(&err))??;
             if chunk.is_empty() {
                 break;
             }
@@ -282,18 +282,25 @@ fn read_blocking(file: std::fs::File, size: u64) -> ByteStream {
     })
 }
 
-fn join_error(err: tokio::task::JoinError) -> io::Error {
+fn join_error(err: &tokio::task::JoinError) -> io::Error {
     io::Error::other(format!("blocking task failed: {err}"))
 }
 
-/// Runs blocking file operations on tokio's blocking pool: the ones io_uring
-/// has no opcode for, and all file data without io_uring.
+/// Runs blocking file operations on tokio's blocking pool: the ones `io_uring`
+/// has no opcode for, and all file data without `io_uring`.
+///
+/// # Errors
+///
+/// Whatever `f` fails with, or an error if the blocking task panics or is
+/// cancelled.
 pub async fn blocking<T, F>(f: F) -> io::Result<T>
 where
     F: FnOnce() -> io::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(f).await.map_err(join_error)?
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|err| join_error(&err))?
 }
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -569,7 +576,7 @@ mod tests {
         consume(&mut batch, 1);
         assert_eq!(batch, [&b"fgh"[..]]);
         consume(&mut batch, 3);
-        assert!(batch.is_empty());
+        assert_eq!(batch, [] as [&[u8]; 0]);
     }
 
     #[tokio::test]

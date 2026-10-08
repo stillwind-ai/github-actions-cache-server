@@ -139,6 +139,12 @@ impl FsStorage {
     /// [`Self::write`]. The data never enters user space: `copy_file_range`
     /// copies it inside the kernel, or shares the extents outright on
     /// filesystems with reflinks (XFS, btrfs).
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidName`] for a name outside the storage root, or the
+    /// underlying I/O error: a missing source is [`io::ErrorKind::NotFound`], a
+    /// length other than `expected_len` [`io::ErrorKind::InvalidData`].
     pub async fn concat(
         &self,
         sources: &[String],
@@ -206,7 +212,13 @@ impl FsStorage {
         Ok(result?)
     }
 
-    /// Atomically renames an object; a missing source is `NotFound`.
+    /// Atomically renames an object.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::NotFound`] when `from` doesn't exist,
+    /// [`StorageError::InvalidName`] for a name outside the storage root, or the
+    /// underlying I/O error.
     pub async fn rename(&self, from: &str, to: &str) -> Result<(), StorageError> {
         match self.io.rename(self.path(from)?, self.path(to)?).await {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -216,6 +228,10 @@ impl FsStorage {
         }
     }
 
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidName`] for a name outside the storage root, or the
+    /// underlying I/O error.
     pub async fn exists(&self, name: &str) -> Result<bool, StorageError> {
         Ok(self.io.file_size(self.path(name)?).await?.is_some())
     }
@@ -285,6 +301,11 @@ impl FsStorage {
 
     /// Number of files directly inside a folder, from the directory entries
     /// alone (no stat per file). A missing folder is empty.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidName`] for a name outside the storage root, or the
+    /// underlying I/O error.
     pub async fn count_files(&self, folder: &str) -> Result<usize, StorageError> {
         let path = self.path(folder)?;
         Ok(blocking(move || {
@@ -458,7 +479,7 @@ mod tests {
                 }
             ]
         );
-        assert!(storage.list_folder("missing").await.unwrap().is_empty());
+        assert_eq!(storage.list_folder("missing").await.unwrap(), []);
         assert_eq!(storage.count_files("123/parts").await.unwrap(), 2);
         assert_eq!(storage.count_files("123").await.unwrap(), 0);
         assert_eq!(storage.count_files("missing").await.unwrap(), 0);

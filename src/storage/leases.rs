@@ -96,6 +96,10 @@ pub async fn release_merge_lease(
 /// lock (ADR-0002), and records the Cache Access, all in one statement and so
 /// one round trip. Returns the location as it was read and the lease, or
 /// `None` when the entry doesn't exist.
+///
+/// # Errors
+///
+/// If the database fails.
 pub async fn lease_for_download(
     db: &impl ConnectionTrait,
     cache_entry_id: Uuid,
@@ -104,7 +108,7 @@ pub async fn lease_for_download(
     let now = Utc::now();
     let statement = Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
         WITH location AS (
             SELECT storage_locations.*
             FROM storage_locations
@@ -122,7 +126,7 @@ pub async fn lease_for_download(
             WHERE storage_locations.id = location.id
         )
         SELECT * FROM location
-        "#,
+        ",
         [
             cache_entry_id.into(),
             lease_id.into(),

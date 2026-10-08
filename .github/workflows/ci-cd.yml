@@ -44,7 +44,11 @@ jobs:
             cache-key: test
             postgres: postgres:17
             io-uring: true
-            run: cargo test --locked
+            # The load benchmarks run in quick mode to keep them working; their
+            # numbers need a quiet machine.
+            run: |
+              cargo test --locked
+              cargo bench --bench workloads --locked -- --quick
           - name: Test (io_uring off)
             cache-key: test
             postgres: postgres:17

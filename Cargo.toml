@@ -68,3 +68,6 @@ codegen-units = 1
 name = "workloads"
 path = "benches/workloads/main.rs"
 harness = false
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }

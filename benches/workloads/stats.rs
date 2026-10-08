@@ -54,13 +54,13 @@ impl Stats {
             .map(|(op, samples)| {
                 let mut samples = samples.clone();
                 samples.sort();
-                let at = |q: f64| samples[((samples.len() - 1) as f64 * q).round() as usize];
+                let at = |percent: usize| samples[(samples.len() - 1) * percent / 100];
                 OpSummary {
                     op,
                     count: samples.len(),
-                    p50: at(0.5),
-                    p90: at(0.9),
-                    p99: at(0.99),
+                    p50: at(50),
+                    p90: at(90),
+                    p99: at(99),
                     max: *samples.last().unwrap(),
                 }
             })

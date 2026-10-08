@@ -4,6 +4,7 @@
 //! Payloads are incompressible bytes, like the zstd and gzip archives and
 //! layers the real clients send.
 
+use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -34,7 +35,7 @@ fn error(err: impl std::fmt::Display) -> String {
     err.to_string()
 }
 
-/// An unsigned runtime token (the server runs with SKIP_TOKEN_VALIDATION).
+/// An unsigned runtime token (the server runs with `SKIP_TOKEN_VALIDATION`).
 fn token(scopes: &Value) -> String {
     let claims = json!({ "ac": scopes.to_string(), "repository_id": "1" });
     format!(
@@ -62,7 +63,7 @@ impl Ctx {
         Self::with_scopes(
             base,
             payload,
-            json!([{ "Scope": "refs/heads/main", "Permission": 3 }]),
+            &json!([{ "Scope": "refs/heads/main", "Permission": 3 }]),
         )
     }
 
@@ -84,11 +85,11 @@ impl Ctx {
         }
     }
 
-    fn with_scopes(base: &str, payload: Bytes, scopes: Value) -> Self {
+    fn with_scopes(base: &str, payload: Bytes, scopes: &Value) -> Self {
         assert!(payload.len() as u64 >= MAX_BODY);
         Self {
             base: base.to_owned(),
-            token: token(&scopes),
+            token: token(scopes),
             stats: Arc::new(Stats::default()),
             payload,
             keep_alive: reqwest::Client::builder()
@@ -103,7 +104,7 @@ impl Ctx {
     }
 
     fn body(&self, len: u64) -> Bytes {
-        self.payload.slice(..len as usize)
+        self.payload.slice(..usize::try_from(len).unwrap())
     }
 
     /// Runs `f`, recording its latency under `op`, or its failure.
@@ -237,10 +238,10 @@ impl Ctx {
         url: &str,
         ids: &[String],
     ) -> Result<()> {
-        let blocks: String = ids
-            .iter()
-            .map(|id| format!("<Latest>{id}</Latest>"))
-            .collect();
+        let blocks: String = ids.iter().fold(String::new(), |mut blocks, id| {
+            let _ = write!(blocks, "<Latest>{id}</Latest>");
+            blocks
+        });
         let body =
             format!(r#"<?xml version="1.0" encoding="utf-8"?><BlockList>{blocks}</BlockList>"#);
         self.put(client, url, &[("comp", "blocklist")], Bytes::from(body))
@@ -373,7 +374,7 @@ pub struct Layer {
     pub size: u64,
 }
 
-/// BuildKit's `type=gha` cache (go-actions-cache on the v2 service): JSON
+/// `BuildKit`'s `type=gha` cache (go-actions-cache on the v2 service): JSON
 /// Twirp on kept-alive connections, one lookup per layer, layers exported one
 /// after another in 1 MiB blocks, and a new index entry per export.
 pub struct Buildkit<'a> {
@@ -396,7 +397,7 @@ impl<'a> Buildkit<'a> {
         format!("buildkit-blob-1-sha256:{}", layer.digest)
     }
 
-    /// GetCacheEntryDownloadURL with the key as its own restore key.
+    /// `GetCacheEntryDownloadURL` with the key as its own restore key.
     async fn load(&self, client: &reqwest::Client, key: &str) -> Option<Value> {
         let ctx = self.ctx;
         let found = ctx
@@ -458,7 +459,7 @@ impl<'a> Buildkit<'a> {
             while offset < size {
                 let mut id = [0u8; 64];
                 id[..16].copy_from_slice(prefix.as_bytes());
-                id[16..20].copy_from_slice(&(ids.len() as u32).to_be_bytes());
+                id[16..20].copy_from_slice(&u32::try_from(ids.len()).unwrap().to_be_bytes());
                 let id = STANDARD.encode(id);
                 let len = (size - offset).min(Self::BLOCK_SIZE);
                 let query = [("comp", "block"), ("blockid", id.as_str())];
@@ -525,11 +526,10 @@ impl<'a> Buildkit<'a> {
                 })
                 .map_or(0, |n| n + 1);
             match self.save(&format!("{prefix}{next}"), index_size).await {
-                Saved::Done => break,
                 Saved::Exists if Instant::now() < deadline => {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
-                Saved::Exists => break,
+                Saved::Done | Saved::Exists => break,
                 Saved::Failed => return false,
             }
         }
@@ -592,7 +592,7 @@ impl<'a> Buildkit<'a> {
     }
 }
 
-/// sccache's GHA backend (OpenDAL `ghac`): protobuf Twirp, exact keys, one
+/// sccache's GHA backend (`OpenDAL` `ghac`): protobuf Twirp, exact keys, one
 /// Put Blob per compilation output, kept-alive connections.
 pub struct Sccache<'a> {
     pub ctx: &'a Ctx,

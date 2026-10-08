@@ -661,11 +661,11 @@ impl Storage {
             .await?;
 
         let fs = self.fs.clone();
-        let parts: Vec<String> = (0..location.part_count as u32)
+        let parts: Vec<String> = (0..location.part_count.cast_unsigned())
             .map(|index| part_name(&location.folder_name, index))
             .collect();
         let merged = merged_name(&location.folder_name);
-        let size = location.size_bytes as u64;
+        let size = location.size_bytes.cast_unsigned();
         let db = self.db.clone();
         self.merges.spawn(async move {
             let renewal = {
@@ -717,6 +717,10 @@ impl Storage {
     /// Finds the best Cache Entry: per scope, the exact primary key, then the
     /// newest entry prefixed by it, then each restore key exactly and by
     /// prefix.
+    ///
+    /// # Errors
+    ///
+    /// If the database fails.
     pub async fn match_cache_entry(&self, query: &MatchQuery<'_>) -> Result<Option<CacheMatch>> {
         Ok(self.find_match(query).await?.map(|(found, _)| found))
     }

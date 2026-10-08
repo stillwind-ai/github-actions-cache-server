@@ -14,6 +14,9 @@
 //! away, and server variables such as `STORAGE_FILESYSTEM_IO_URING` pass
 //! through.
 
+// Report arithmetic: f64 is exact far beyond any size or time measured here.
+#![allow(clippy::cast_precision_loss)]
+
 mod clients;
 mod latency;
 mod scenarios;
@@ -58,8 +61,8 @@ async fn run(scenario: &Scenario, payload: &Bytes) -> Measurement {
     let (user_after, system_after) = server.cpu();
     let measurement = Measurement {
         wall,
-        user: user_after - user,
-        system: system_after - system,
+        user: user_after.saturating_sub(user),
+        system: system_after.saturating_sub(system),
         peak_rss: server.peak_rss(),
         summary: ctx.stats.summary(),
     };
@@ -189,7 +192,7 @@ async fn main() {
         server::binary(),
         if quick { " (quick)" } else { "" }
     );
-    let mut payload = vec![0u8; 128 * MIB as usize];
+    let mut payload = vec![0u8; usize::try_from(128 * MIB).unwrap()];
     rand::fill(&mut payload[..]);
     let payload = Bytes::from(payload);
 

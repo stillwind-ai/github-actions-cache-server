@@ -1,6 +1,6 @@
 //! Workload generators, driven by `profiles.json`: profiles distilled from
 //! traffic the real clients sent to this server (see `benches/README.md`).
-//! Archive sizes, key shapes, restore keys, BuildKit layer chains and the
+//! Archive sizes, key shapes, restore keys, `BuildKit` layer chains and the
 //! layers each build downloads are the captured ones; keys are fresh, and
 //! every generator is seeded, so a scenario sends the same requests each run.
 
@@ -151,7 +151,7 @@ fn archives(seed: u64) -> Vec<Archive> {
     archives
 }
 
-/// A captured BuildKit image with fresh layer digests.
+/// A captured `BuildKit` image with fresh layer digests.
 struct Build {
     index: String,
     chain: Vec<Layer>,
@@ -273,7 +273,7 @@ async fn lookup_storm(ctx: &Ctx) {
         .map(|client| async move {
             let pull_request = ctx.pull_request(client);
             let cache = ActionsCache(&pull_request);
-            let mut rng = StdRng::seed_from_u64(client as u64);
+            let mut rng = StdRng::seed_from_u64(u64::from(client));
             let version = hex(&mut rng, 64);
             for _ in 0..lookups {
                 let key = format!(
@@ -295,7 +295,7 @@ async fn lookup_storm(ctx: &Ctx) {
 /// A mixed CI fleet: runners each run a sequence of jobs, about half of them
 /// pull requests. Dependency-cache jobs restore an `@actions/cache` archive
 /// (and after a lockfile change save a new one); Docker jobs import and export
-/// BuildKit caches.
+/// `BuildKit` caches.
 async fn fleet(ctx: &Ctx) {
     let (runners, jobs_per_runner) = if quick() { (4, 3) } else { (16, 6) };
     let archives = archives(1);
@@ -305,7 +305,7 @@ async fn fleet(ctx: &Ctx) {
             let archives = &archives;
             let images = &images;
             async move {
-                let mut rng = StdRng::seed_from_u64(1000 + runner as u64);
+                let mut rng = StdRng::seed_from_u64(1000 + u64::from(runner));
                 for job in 0..jobs_per_runner {
                     let pull_request = ctx.pull_request(runner * 100 + job);
                     let ctx = if rng.random_bool(0.5) {
@@ -365,6 +365,7 @@ async fn fleet(ctx: &Ctx) {
     bounded(runs, runners as usize).await;
 }
 
+#[allow(clippy::too_many_lines)] // One entry per scenario.
 pub fn all(quick: bool) -> Vec<Scenario> {
     QUICK.store(quick, Ordering::Relaxed);
     vec![
