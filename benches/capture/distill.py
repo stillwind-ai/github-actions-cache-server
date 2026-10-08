@@ -6,8 +6,9 @@ profiles the benchmarks replay: benches/workloads/profiles.json.
 
 Keys are reduced to their shape (prefix and length) and payloads to sizes, so
 the profiles carry no project data. Each capture directory holds one
-scenario's trace.jsonl; `GET /__phase/<name>/start|end` marker requests split
-a trace into phases (cold build, warm build, ...).
+scenario's trace.jsonl; `GET /__phase/<name>/start|end` (or
+`/__marker/<name>-start|end`) marker requests split a trace into phases (cold
+build, warm build, ...).
 """
 import json
 import sys
@@ -26,8 +27,11 @@ def phases(records):
     out, current, name = {}, [], "all"
     for record in records:
         url = record["url"]
-        if url.startswith("/__phase/"):
-            _, _, phase, edge = url.split("/")[:4]
+        if url.startswith(("/__phase/", "/__marker/")):
+            if url.startswith("/__phase/"):
+                _, _, phase, edge = url.split("/")[:4]
+            else:
+                phase, _, edge = url.split("/")[2].rpartition("-")
             if edge == "start":
                 current, name = [], phase
             else:
@@ -115,13 +119,58 @@ def buildkit(directory):
     return profile
 
 
+def shape(key):
+    """A key's shape without its hashes: `node-cache-Linux-x64-npm-<64>`."""
+    import re
+    return re.sub(r"[0-9a-f]{8,}", lambda match: f"<{len(match.group())}>", key)
+
+
+def actions_cache(directory):
+    """Every `@actions/cache` save and restore in a trace: archive sizes,
+    key shapes, restore-key counts and lookup outcomes."""
+    records = load(directory / "trace.jsonl")
+    saves, lookups = [], []
+    for method, request, response, record in twirp_calls(records):
+        if method == "FinalizeCacheEntryUpload":
+            saves.append({"key": shape(request["key"]), "size": int(request["size_bytes"])})
+        elif method == "GetCacheEntryDownloadURL":
+            lookups.append({
+                "key": shape(request["key"]),
+                "restore_keys": len(request.get("restore_keys") or []),
+                "hit": response.get("ok") is True,
+                "exact": response.get("matched_key") == request["key"],
+            })
+    restores = [record["resp_bytes"] for record in records if record["method"] == "GET" and "/download/" in record["url"]]
+    return {"source": directory.name, "saves": saves, "lookups": lookups, "restores": restores}
+
+
+def sccache(directory):
+    """The objects one cold sccache build writes, in order (one per
+    compilation unit), and how many it reads back when warm."""
+    by_phase = phases(load(directory / "trace.jsonl"))
+    puts = lambda records: [r["req_bytes"] for r in records if r["method"] == "PUT" and "/upload/" in r["url"]]
+    gets = lambda records: [r for r in records if r["method"] == "GET" and "/download/" in r["url"]]
+    return {
+        "source": directory.name,
+        "objects": puts(by_phase["cold"]),
+        "warm_reads": len(gets(by_phase["warm"])),
+    }
+
+
 def main():
     root = Path(sys.argv[1])
-    profiles = {"buildkit": {}}
+    profiles = {"buildkit": {}, "actions_cache": [], "sccache": []}
     for directory in sorted(root.glob("docker-*")):
         by_phase = phases(load(directory / "trace.jsonl"))
         if {"run1-cold", "run2-warm"} <= by_phase.keys():
             profiles["buildkit"][directory.name.removeprefix("docker-")] = buildkit(directory)
+    for directory in sorted([*root.glob("node-*"), *root.glob("rust-*")]):
+        if not (directory / "trace.jsonl").exists():
+            continue
+        if "sccache" in directory.name:
+            profiles["sccache"].append(sccache(directory))
+        else:
+            profiles["actions_cache"].append(actions_cache(directory))
     json.dump(profiles, sys.stdout, indent=1)
     print()
 

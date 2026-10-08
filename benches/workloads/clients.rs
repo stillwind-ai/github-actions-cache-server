@@ -34,6 +34,16 @@ fn error(err: impl std::fmt::Display) -> String {
     err.to_string()
 }
 
+/// An unsigned runtime token (the server runs with SKIP_TOKEN_VALIDATION).
+fn token(scopes: &Value) -> String {
+    let claims = json!({ "ac": scopes.to_string(), "repository_id": "1" });
+    format!(
+        "{}.{}.signature",
+        URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#),
+        URL_SAFE_NO_PAD.encode(claims.to_string())
+    )
+}
+
 /// What every emulator shares: the server, its token, the payload bytes and
 /// two HTTP clients, since real clients differ in connection reuse.
 pub struct Ctx {
@@ -47,19 +57,38 @@ pub struct Ctx {
 }
 
 impl Ctx {
+    /// A push to the default branch: one scope, read and write.
     pub fn new(base: &str, payload: Bytes) -> Self {
+        Self::with_scopes(
+            base,
+            payload,
+            json!([{ "Scope": "refs/heads/main", "Permission": 3 }]),
+        )
+    }
+
+    /// The same client as a pull request run: it writes its own ref and
+    /// reads the default branch, so a miss is looked up in both scopes.
+    /// Shares this context's stats and connections.
+    pub fn pull_request(&self, number: u32) -> Self {
+        let scopes = json!([
+            { "Scope": format!("refs/pull/{number}/merge"), "Permission": 3 },
+            { "Scope": "refs/heads/main", "Permission": 1 },
+        ]);
+        Self {
+            token: token(&scopes),
+            base: self.base.clone(),
+            stats: self.stats.clone(),
+            payload: self.payload.clone(),
+            keep_alive: self.keep_alive.clone(),
+            no_keep_alive: self.no_keep_alive.clone(),
+        }
+    }
+
+    fn with_scopes(base: &str, payload: Bytes, scopes: Value) -> Self {
         assert!(payload.len() as u64 >= MAX_BODY);
-        let claims = json!({
-            "ac": json!([{ "Scope": "refs/heads/main", "Permission": 3 }]).to_string(),
-            "repository_id": "1",
-        });
         Self {
             base: base.to_owned(),
-            token: format!(
-                "{}.{}.signature",
-                URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#),
-                URL_SAFE_NO_PAD.encode(claims.to_string())
-            ),
+            token: token(&scopes),
             stats: Arc::new(Stats::default()),
             payload,
             keep_alive: reqwest::Client::builder()
@@ -113,6 +142,24 @@ impl Ctx {
             ));
         }
         response.json().await.map_err(error)
+    }
+
+    /// A JSON Twirp call that reports the status of an error response too.
+    async fn twirp_json_status(
+        &self,
+        client: &reqwest::Client,
+        method: &str,
+        body: Value,
+    ) -> Result<(reqwest::StatusCode, Value)> {
+        let response = client
+            .post(format!("{}/{CACHE_SERVICE}/{method}", self.base))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(error)?;
+        let status = response.status();
+        Ok((status, response.json().await.unwrap_or(Value::Null)))
     }
 
     async fn twirp_protobuf<R: Message + Default>(
@@ -313,6 +360,13 @@ impl ActionsCache<'_> {
     }
 }
 
+enum Saved {
+    Done,
+    /// Another client holds the key (Twirp `already_exists`).
+    Exists,
+    Failed,
+}
+
 #[derive(Clone, Debug)]
 pub struct Layer {
     pub digest: String,
@@ -358,27 +412,40 @@ impl<'a> Buildkit<'a> {
         (found["ok"] == true).then_some(found)
     }
 
-    async fn save(&self, key: &str, size: u64) -> bool {
+    async fn save(&self, key: &str, size: u64) -> Saved {
         let ctx = self.ctx;
         let client = &ctx.keep_alive;
-        let Some(created) = ctx
-            .timed(
-                "create",
-                ctx.twirp_json(
-                    client,
-                    "CreateCacheEntry",
-                    json!({ "key": key, "version": self.version }),
-                ),
+        let started = Instant::now();
+        let created = match ctx
+            .twirp_json_status(
+                client,
+                "CreateCacheEntry",
+                json!({ "key": key, "version": self.version }),
             )
             .await
-        else {
-            return false;
+        {
+            // Twirp `already_exists`: someone else saves this key.
+            Ok((status, _)) if status == 409 => {
+                ctx.stats.record("create", started.elapsed());
+                return Saved::Exists;
+            }
+            Ok((status, created)) if status.is_success() && created["ok"] == true => {
+                ctx.stats.record("create", started.elapsed());
+                created
+            }
+            Ok((status, created)) => {
+                // go-actions-cache fails the export on anything but a 409.
+                ctx.stats.fail(
+                    "create",
+                    format!("{status} {created} (BuildKit fails the export)"),
+                );
+                return Saved::Failed;
+            }
+            Err(err) => {
+                ctx.stats.fail("create", err);
+                return Saved::Failed;
+            }
         };
-        if created["ok"] != true {
-            // BuildKit fails the export on anything but a 409.
-            ctx.stats.fail("create", "ok:false (export fails)");
-            return false;
-        }
         let url = created["signed_upload_url"].as_str().unwrap().to_owned();
         let uploaded = if size < Self::BLOCK_SIZE {
             ctx.timed("put blob", ctx.put(client, &url, &[], ctx.body(size)))
@@ -397,7 +464,7 @@ impl<'a> Buildkit<'a> {
                 let query = [("comp", "block"), ("blockid", id.as_str())];
                 let put = ctx.put(client, &url, &query, ctx.body(len));
                 if ctx.timed("put block", put).await.is_none() {
-                    return false;
+                    return Saved::Failed;
                 }
                 ids.push(id);
                 offset += len;
@@ -406,7 +473,7 @@ impl<'a> Buildkit<'a> {
                 .await
                 .is_some()
         };
-        uploaded
+        let finalized = uploaded
             && ctx
                 .timed(
                     "finalize",
@@ -417,41 +484,57 @@ impl<'a> Buildkit<'a> {
                     ),
                 )
                 .await
-                .is_some()
+                .is_some();
+        if finalized {
+            Saved::Done
+        } else {
+            Saved::Failed
+        }
     }
 
     /// `--cache-to type=gha`: existence check per layer, upload of missing
     /// layers, then the next `index-…#N`. `index` is e.g.
     /// `index-buildkit-1-0123abcd`.
     pub async fn export(&self, index: &str, layers: &[Layer], index_size: u64) -> bool {
+        let ctx = self.ctx;
         let started = Instant::now();
         for layer in layers {
             let key = Self::blob_key(layer);
-            if self.load(&self.ctx.keep_alive, &key).await.is_none()
-                && !self.save(&key, layer.size).await
+            if self.load(&ctx.keep_alive, &key).await.is_none()
+                && matches!(self.save(&key, layer.size).await, Saved::Failed)
             {
                 return false;
             }
         }
+        // `SaveMutable`: the next `#N`, retried every 2 s while a concurrent
+        // export takes it, for up to 15 s.
         let prefix = format!("{index}#");
-        let previous = self.load(&self.ctx.keep_alive, &prefix).await;
-        // Loaded again to detect a concurrent export.
-        let _ = self.load(&self.ctx.keep_alive, &prefix).await;
-        let next = previous
-            .and_then(|found| {
-                found["matched_key"]
-                    .as_str()?
-                    .rsplit_once('#')?
-                    .1
-                    .parse::<u64>()
-                    .ok()
-            })
-            .map_or(0, |n| n + 1);
-        let saved = self.save(&format!("{prefix}{next}"), index_size).await;
-        if saved {
-            self.ctx.stats.record("export", started.elapsed());
+        let deadline = Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let previous = self.load(&ctx.keep_alive, &prefix).await;
+            // Loaded again to detect a concurrent export.
+            let _ = self.load(&ctx.keep_alive, &prefix).await;
+            let next = previous
+                .and_then(|found| {
+                    found["matched_key"]
+                        .as_str()?
+                        .rsplit_once('#')?
+                        .1
+                        .parse::<u64>()
+                        .ok()
+                })
+                .map_or(0, |n| n + 1);
+            match self.save(&format!("{prefix}{next}"), index_size).await {
+                Saved::Done => break,
+                Saved::Exists if Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                Saved::Exists => break,
+                Saved::Failed => return false,
+            }
         }
-        saved
+        ctx.stats.record("export", started.elapsed());
+        true
     }
 
     /// `--cache-from type=gha`: the newest index, a burst of lookups for
