@@ -13,10 +13,11 @@ use bytes::Bytes;
 use chrono::Utc;
 use futures::{Stream, StreamExt};
 use rand::Rng;
-use sea_orm::sea_query::{Expr, Func, LikeExpr, LockType, OnConflict, Query};
+use sea_orm::sea_query::{CaseStatement, Expr, Func, LikeExpr, LockType, OnConflict, Query};
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, ExprTrait, JoinType,
-    Order, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait, TransactionTrait,
+    ActiveValue::Set, ColumnTrait, Condition, DatabaseConnection, DbErr, EntityTrait, ExprTrait,
+    JoinType, Order, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait,
+    TransactionTrait,
 };
 use serde::Serialize;
 use tokio::sync::oneshot;
@@ -726,49 +727,79 @@ impl Storage {
     }
 
     /// Finds the best Cache Entry: per scope, the exact primary key, then the
-    /// newest entry prefixed by it, then each restore key exactly and by prefix.
-    ///
-    /// # Errors
-    ///
-    /// If the database or a storage existence check fails.
+    /// newest entry prefixed by it, then each restore key exactly and by
+    /// prefix.
     pub async fn match_cache_entry(&self, query: &MatchQuery<'_>) -> Result<Option<CacheMatch>> {
-        for scope in query.scopes {
-            let candidates = std::iter::once((
-                query.primary_key,
-                MatchType::ExactPrimary,
-                MatchType::PrefixedPrimary,
-            ))
-            .chain(query.restore_keys.iter().map(|key| {
-                (
-                    key.as_str(),
-                    MatchType::ExactRestore,
-                    MatchType::PrefixedRestore,
-                )
-            }));
-            for (key, exact, prefixed) in candidates {
-                for (match_type, condition) in [
-                    (exact, cache_entry::Column::Key.eq(key)),
-                    (
-                        prefixed,
-                        Expr::col((cache_entry::Entity, cache_entry::Column::Key))
-                            .like(LikeExpr::new(format!("{}%", escape_like(key))).escape('\\')),
-                    ),
-                ] {
-                    let entry = cache_entry::Entity::find()
-                        .filter(cache_entry::Column::RepoId.eq(query.repo_id))
-                        .filter(cache_entry::Column::Scope.eq(scope))
-                        .filter(cache_entry::Column::Version.eq(query.version))
-                        .filter(condition)
-                        .order_by_desc(cache_entry::Column::UpdatedAt)
-                        .one(&self.db)
-                        .await?;
-                    if let Some(entry) = entry {
-                        return Ok(Some(CacheMatch { entry, match_type }));
-                    }
+        Ok(self.find_match(query).await?.map(|(found, _)| found))
+    }
+
+    /// [`Self::match_cache_entry`] in one query, with the entry's Storage
+    /// Location. Every candidate is ranked by the first (scope, key, exact or
+    /// prefix) level it satisfies, so the lowest rank, newest first, is the
+    /// entry that checking the levels one by one would find, without a round
+    /// trip per level.
+    async fn find_match(
+        &self,
+        query: &MatchQuery<'_>,
+    ) -> Result<Option<(CacheMatch, Option<storage_location::Model>)>> {
+        let keys: Vec<&str> = std::iter::once(query.primary_key)
+            .chain(query.restore_keys.iter().map(String::as_str))
+            .collect();
+        let scope = || Expr::col((cache_entry::Entity, cache_entry::Column::Scope));
+        let key = || Expr::col((cache_entry::Entity, cache_entry::Column::Key));
+        let prefixed = |prefix: &str| {
+            key().like(LikeExpr::new(format!("{}%", escape_like(prefix))).escape('\\'))
+        };
+        let mut rank = CaseStatement::new();
+        let mut level = 0;
+        for scope_name in query.scopes {
+            for candidate in &keys {
+                for condition in [key().eq(*candidate), prefixed(candidate)] {
+                    rank = rank.case(
+                        Condition::all()
+                            .add(scope().eq(scope_name.as_str()))
+                            .add(condition),
+                        Expr::val(level),
+                    );
+                    level += 1;
                 }
             }
         }
-        Ok(None)
+        let Some((entry, location)) = cache_entry::Entity::find()
+            .find_also_related(storage_location::Entity)
+            .filter(cache_entry::Column::RepoId.eq(query.repo_id))
+            .filter(cache_entry::Column::Version.eq(query.version))
+            .filter(cache_entry::Column::Scope.is_in(query.scopes))
+            .filter(keys.iter().fold(Condition::any(), |any, candidate| {
+                any.add(prefixed(candidate))
+            }))
+            .order_by(
+                Into::<Expr>::into(rank.finally(Expr::val(level))),
+                Order::Asc,
+            )
+            .order_by_desc(cache_entry::Column::UpdatedAt)
+            .one(&self.db)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let match_type = keys
+            .iter()
+            .enumerate()
+            .find_map(|(index, candidate)| {
+                let (exact, prefixed) = if index == 0 {
+                    (MatchType::ExactPrimary, MatchType::PrefixedPrimary)
+                } else {
+                    (MatchType::ExactRestore, MatchType::PrefixedRestore)
+                };
+                if entry.key == *candidate {
+                    Some(exact)
+                } else {
+                    entry.key.starts_with(candidate).then_some(prefixed)
+                }
+            })
+            .expect("the query only returns entries matching a key");
+        Ok(Some((CacheMatch { entry, match_type }, location)))
     }
 
     /// Matches a Cache Entry and returns its download URL. Returning a URL is
@@ -785,12 +816,9 @@ impl Storage {
         query: &MatchQuery<'_>,
     ) -> Result<Option<(String, cache_entry::Model)>> {
         for _ in 0..MAX_DANGLING_PURGE_ATTEMPTS {
-            let Some(CacheMatch { entry, .. }) = self.match_cache_entry(query).await? else {
+            let Some((CacheMatch { entry, .. }, location)) = self.find_match(query).await? else {
                 return Ok(None);
             };
-            let location = storage_location::Entity::find_by_id(entry.location_id)
-                .one(&self.db)
-                .await?;
             let valid = match &location {
                 Some(location) => self.storage_has_data(location).await?,
                 None => false,

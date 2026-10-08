@@ -19,6 +19,10 @@ pub async fn connect(config: &Config) -> Result<DatabaseConnection, DbErr> {
         .max_connections(config.database_max_connections)
         .connect_timeout(Duration::from_secs(10))
         .acquire_timeout(Duration::from_secs(30))
+        // A ping before every statement doubles the round trips to the
+        // database; only a connection that sat idle long enough for a
+        // restart or a proxy to have dropped it is checked first.
+        .test_before_acquire_if_idle_for(Duration::from_secs(30))
         .sqlx_logging(config.debug)
         .sqlx_logging_level(tracing::log::LevelFilter::Debug);
     Database::connect(options).await

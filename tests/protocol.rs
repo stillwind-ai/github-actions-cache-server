@@ -93,6 +93,64 @@ async fn matches_primary_and_restore_keys_by_exact_key_then_newest_prefix() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn match_priority_outranks_recency() {
+    let server = start().await;
+    server.save("pkg", "v1", b"exact", 1024).await;
+    server.save("pkg-newer", "v1", b"prefixed", 1024).await;
+    server.save("app-old", "v1", b"primary prefix", 1024).await;
+    server.save("lib-x", "v1", b"restore exact", 1024).await;
+
+    // An exact key beats a newer entry it is a prefix of.
+    assert_eq!(server.lookup("pkg", &[], "v1").await.unwrap().1, "pkg");
+    // A primary-key prefix beats a newer exact restore key.
+    assert_eq!(
+        server.lookup("app-", &["lib-x"], "v1").await.unwrap().1,
+        "app-old"
+    );
+
+    // The branch's own scope, even by prefix, beats main's exact key.
+    let feature = token(
+        json!([
+            { "Scope": "refs/heads/main", "Permission": 1 },
+            { "Scope": "refs/heads/feature", "Permission": 3 },
+        ]),
+        "123",
+    );
+    let created: Value = server
+        .twirp_as(
+            &feature,
+            "CreateCacheEntry",
+            json!({ "key": "pkg-feature", "version": "v1" }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    server
+        .upload_blocks(created["signed_upload_url"].as_str().unwrap(), b"f", 1024)
+        .await;
+    let finalized = server
+        .twirp_as(
+            &feature,
+            "FinalizeCacheEntryUpload",
+            json!({ "key": "pkg-feature", "version": "v1" }),
+        )
+        .await;
+    assert_eq!(finalized.status(), 200);
+    let found: Value = server
+        .twirp_as(
+            &feature,
+            "GetCacheEntryDownloadURL",
+            json!({ "key": "pkg", "version": "v1" }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(found["matched_key"], "pkg-feature");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn scopes_and_repositories_isolate_entries() {
     let server = start().await;
     server.save("shared-key", "v1", b"main", 1024).await;
