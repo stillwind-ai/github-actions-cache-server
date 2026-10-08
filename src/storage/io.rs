@@ -4,8 +4,8 @@
 //! (open, read, write, close, statx, rename, unlink, mkdir) run on a small pool
 //! of `tokio-uring` worker threads, each owning its own ring and current-thread
 //! runtime; the multi-threaded server runtime hands them jobs over channels.
-//! Operations io_uring has no opcode for (readdir, statvfs, recursive delete)
-//! run on tokio's blocking pool. When io_uring is disabled or the kernel refuses
+//! Operations `io_uring` has no opcode for (readdir, statvfs, recursive delete)
+//! run on tokio's blocking pool. When `io_uring` is disabled or the kernel refuses
 //! a ring at startup, everything falls back to `tokio::fs`.
 
 use std::io;
@@ -29,7 +29,7 @@ pub enum FileIo {
 }
 
 impl FileIo {
-    /// io_uring when requested and available, otherwise `tokio::fs`.
+    /// `io_uring` when requested and available, otherwise `tokio::fs`.
     pub fn new(use_io_uring: bool, threads: usize) -> Self {
         if !use_io_uring {
             tracing::info!("Filesystem storage I/O uses tokio::fs (io_uring disabled)");
@@ -55,6 +55,7 @@ impl FileIo {
         Self::Tokio
     }
 
+    #[must_use]
     pub fn is_io_uring(&self) -> bool {
         !matches!(self, Self::Tokio)
     }
@@ -62,6 +63,10 @@ impl FileIo {
     /// Opens `path` and streams its contents. Opening happens before this
     /// returns, so a missing file surfaces as `NotFound` here rather than as a
     /// stream error.
+    ///
+    /// # Errors
+    ///
+    /// If the file can't be opened.
     pub async fn read_file(&self, path: PathBuf) -> io::Result<ByteStream> {
         match self {
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -78,6 +83,10 @@ impl FileIo {
     /// Writes `stream` to a newly created (or truncated) file at `path` and
     /// returns the number of bytes written. An error item aborts the write and
     /// is returned; the partial file is left for the caller to remove.
+    ///
+    /// # Errors
+    ///
+    /// If `stream` yields an error or the file can't be written.
     pub async fn write_file<S>(&self, path: PathBuf, stream: S) -> io::Result<u64>
     where
         S: Stream<Item = io::Result<Bytes>> + Send + 'static,
@@ -102,6 +111,10 @@ impl FileIo {
     }
 
     /// Size of the file at `path`, or `None` when nothing exists there.
+    ///
+    /// # Errors
+    ///
+    /// If `path` can't be inspected for a reason other than not existing.
     pub async fn file_size(&self, path: PathBuf) -> io::Result<Option<u64>> {
         let result = match self {
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -122,6 +135,9 @@ impl FileIo {
         }
     }
 
+    /// # Errors
+    ///
+    /// If the rename fails.
     pub async fn rename(&self, from: PathBuf, to: PathBuf) -> io::Result<()> {
         match self {
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -133,6 +149,9 @@ impl FileIo {
         }
     }
 
+    /// # Errors
+    ///
+    /// If the file can't be removed.
     pub async fn remove_file(&self, path: PathBuf) -> io::Result<()> {
         match self {
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -144,6 +163,9 @@ impl FileIo {
         }
     }
 
+    /// # Errors
+    ///
+    /// If a directory can't be created.
     pub async fn create_dir_all(&self, path: PathBuf) -> io::Result<()> {
         match self {
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -187,7 +209,12 @@ where
     }
 }
 
-/// Blocking-pool helper for operations io_uring has no opcode for.
+/// Blocking-pool helper for operations `io_uring` has no opcode for.
+///
+/// # Errors
+///
+/// Whatever `f` fails with, or an error if the blocking task panics or is
+/// cancelled.
 pub async fn blocking<T, F>(f: F) -> io::Result<T>
 where
     F: FnOnce() -> io::Result<T> + Send + 'static,
@@ -357,9 +384,9 @@ mod uring {
                 Ok::<_, io::Error>(())
             };
 
-            let (written, fed) = tokio::join!(write, feed);
+            let (written, body) = tokio::join!(write, feed);
             // A failed body must not look like a complete file.
-            fed?;
+            body?;
             written?
         }
     }
@@ -373,7 +400,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("object");
         let payload: Vec<u8> = (0..(CHUNK_SIZE * 3 + 123))
-            .map(|i| (i % 251) as u8)
+            .map(|i| u8::try_from(i % 251).unwrap())
             .collect();
 
         // Small frames, to exercise coalescing.

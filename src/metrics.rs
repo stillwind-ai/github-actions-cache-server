@@ -1,5 +1,5 @@
 //! Prometheus metrics. Per-process, as in ADR-0007: scale with replicas and
-//! aggregate in PromQL.
+//! aggregate in `PromQL`.
 
 use prometheus::{Encoder, IntCounter, IntCounterVec, IntGauge, Opts, Registry, TextEncoder};
 
@@ -11,6 +11,10 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    /// # Panics
+    ///
+    /// If a metric is invalid or registered twice: a programming error.
+    #[must_use]
     pub fn new() -> Self {
         let registry = Registry::new();
         #[cfg(target_os = "linux")]
@@ -66,8 +70,15 @@ impl Metrics {
 
     /// Renders the text exposition format; storage bytes are computed at
     /// scrape time from the sizes recorded at upload completion (ADR-0008).
+    ///
+    /// # Panics
+    ///
+    /// If the registry holds a metric the text format can't encode: a
+    /// programming error.
+    #[must_use]
     pub fn render(&self, cache_storage_bytes: u64) -> String {
-        self.cache_storage_bytes.set(cache_storage_bytes as i64);
+        self.cache_storage_bytes
+            .set(i64::try_from(cache_storage_bytes).unwrap_or(i64::MAX));
         let mut buffer = Vec::new();
         TextEncoder::new()
             .encode(&self.registry.gather(), &mut buffer)

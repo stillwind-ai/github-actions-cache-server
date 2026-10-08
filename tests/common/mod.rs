@@ -29,7 +29,7 @@ impl Drop for TestServer {
 }
 
 /// An unsigned runtime token; the test server skips signature validation.
-pub fn token(scopes: Value, repository_id: &str) -> String {
+pub fn token(scopes: &Value, repository_id: &str) -> String {
     let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#);
     let payload = URL_SAFE_NO_PAD
         .encode(json!({ "ac": scopes.to_string(), "repository_id": repository_id }).to_string());
@@ -38,7 +38,7 @@ pub fn token(scopes: Value, repository_id: &str) -> String {
 
 pub fn main_token() -> String {
     token(
-        json!([{ "Scope": "refs/heads/main", "Permission": 3 }]),
+        &json!([{ "Scope": "refs/heads/main", "Permission": 3 }]),
         "123",
     )
 }

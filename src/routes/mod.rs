@@ -29,6 +29,7 @@ pub struct AppState {
 const CACHE_SERVICE: &str = "/twirp/github.actions.results.api.v1.CacheService";
 
 pub fn router(state: AppState) -> Router {
+    let debug = state.config.debug;
     let mut router = Router::new()
         .route("/", get(misc::index))
         .route("/health", get(misc::health))
@@ -52,9 +53,9 @@ pub fn router(state: AppState) -> Router {
         .fallback(proxy::results_passthrough)
         // Uploads and passthrough bodies are streamed, never buffered.
         .layer(DefaultBodyLimit::disable())
-        .with_state(state.clone());
+        .with_state(state);
 
-    if state.config.debug {
+    if debug {
         router = router.layer(tower_http::trace::TraceLayer::new_for_http());
     }
     router

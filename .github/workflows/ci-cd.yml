@@ -17,28 +17,43 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  lint:
-    name: 💅 Lint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
-
-  test:
-    name: 🧪 Tests (io_uring ${{ matrix.io-uring }})
+  rust:
+    name: 🦀 ${{ matrix.name }}
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        io-uring: [true, false]
+        include:
+          - name: Format
+            components: rustfmt
+            run: cargo fmt --all --check
+          # Pedantic lints are enabled in Cargo.toml's [lints.clippy], so local
+          # `cargo clippy` runs match CI.
+          - name: Clippy (pedantic)
+            components: clippy
+            cache-key: clippy
+            run: |
+              cargo clippy --all-targets --all-features --locked -- -D warnings
+              cargo clippy --all-targets --no-default-features --locked -- -D warnings
+          - name: Check
+            cache-key: check
+            run: |
+              cargo check --all-targets --all-features --locked
+              cargo check --all-targets --no-default-features --locked
+          - name: Test (io_uring on)
+            cache-key: test
+            postgres: postgres:17
+            io-uring: true
+            run: cargo test --locked
+          - name: Test (io_uring off)
+            cache-key: test
+            postgres: postgres:17
+            io-uring: false
+            run: cargo test --locked
     services:
       postgres:
-        image: postgres:17
+        # An empty image skips the service for entries that don't need it.
+        image: ${{ matrix.postgres || '' }}
         env:
           POSTGRES_PASSWORD: postgres
         ports:
@@ -51,8 +66,20 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: ${{ matrix.components }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked
+        if: matrix.cache-key
+        with:
+          key: ${{ matrix.cache-key }}
+      - run: ${{ matrix.run }}
+
+  scripts:
+    name: 🐍 Release scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
 
   nix:
     name: ❄️ Nix flake
@@ -117,7 +144,7 @@ jobs:
     permissions:
       packages: write
       contents: read
-    needs: [lint, test, nix, docker, helm]
+    needs: [rust, scripts, nix, docker, helm]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
