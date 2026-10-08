@@ -131,11 +131,56 @@ impl FsStorage {
     where
         S: Stream<Item = io::Result<Bytes>> + Send + 'static,
     {
+        self.write_atomically(name, expected_len, |temp| self.io.write_file(temp, stream))
+            .await
+    }
+
+    /// Writes the concatenation of the `sources` objects as `name`, like
+    /// [`Self::write`]. The data never enters user space: `copy_file_range`
+    /// copies it inside the kernel, or shares the extents outright on
+    /// filesystems with reflinks (XFS, btrfs).
+    pub async fn concat(
+        &self,
+        sources: &[String],
+        name: &str,
+        expected_len: u64,
+    ) -> Result<u64, StorageError> {
+        let sources = sources
+            .iter()
+            .map(|source| self.path(source))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.write_atomically(name, Some(expected_len), |temp| {
+            blocking(move || {
+                let mut target = std::fs::File::create(temp)?;
+                let mut written = 0;
+                for source in sources {
+                    // `io::copy` between files is `copy_file_range`, with
+                    // fallbacks for filesystems that refuse it.
+                    written += std::io::copy(&mut std::fs::File::open(source)?, &mut target)?;
+                }
+                Ok(written)
+            })
+        })
+        .await
+    }
+
+    /// Runs `write` against a fresh temp entry and renames it to `name` (see
+    /// [`Self::write`]).
+    async fn write_atomically<F, W>(
+        &self,
+        name: &str,
+        expected_len: Option<u64>,
+        write: F,
+    ) -> Result<u64, StorageError>
+    where
+        F: FnOnce(PathBuf) -> W,
+        W: Future<Output = io::Result<u64>>,
+    {
         let path = self.path(name)?;
         let temp = self.root.join(format!("tmp-{}", uuid::Uuid::new_v4()));
 
         let result = async {
-            let written = self.io.write_file(temp.clone(), stream).await?;
+            let written = write(temp.clone()).await?;
             if let Some(expected) = expected_len
                 && written != expected
             {
@@ -232,12 +277,25 @@ impl FsStorage {
         .await?)
     }
 
-    /// # Errors
-    ///
-    /// [`StorageError::InvalidName`] for a name outside the storage root, or the
-    /// underlying I/O error.
+    /// Number of files directly inside a folder, from the directory entries
+    /// alone (no stat per file). A missing folder is empty.
     pub async fn count_files(&self, folder: &str) -> Result<usize, StorageError> {
-        Ok(self.list_folder(folder).await?.len())
+        let path = self.path(folder)?;
+        Ok(blocking(move || {
+            let entries = match std::fs::read_dir(&path) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+                Err(err) => return Err(err),
+            };
+            let mut count = 0;
+            for entry in entries {
+                if entry?.file_type()?.is_file() {
+                    count += 1;
+                }
+            }
+            Ok(count)
+        })
+        .await?)
     }
 
     /// Inventory of every top-level entry under the root.
@@ -394,7 +452,10 @@ mod tests {
                 }
             ]
         );
-        assert_eq!(storage.list_folder("missing").await.unwrap(), []);
+        assert!(storage.list_folder("missing").await.unwrap().is_empty());
+        assert_eq!(storage.count_files("123/parts").await.unwrap(), 2);
+        assert_eq!(storage.count_files("123").await.unwrap(), 0);
+        assert_eq!(storage.count_files("missing").await.unwrap(), 0);
 
         // No temp entries are left behind.
         let folders = storage.list_storage_folders().await.unwrap();
@@ -440,6 +501,35 @@ mod tests {
         assert!(!storage.exists("1/merged").await.unwrap());
         assert!(!storage.exists("1/parts/0").await.unwrap());
         assert!(storage.list_storage_folders().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concatenates_objects() {
+        let (_dir, storage) = storage().await;
+        storage
+            .write("7/parts/0", body(b"hello "), None)
+            .await
+            .unwrap();
+        storage
+            .write("7/parts/1", body(b"world"), None)
+            .await
+            .unwrap();
+        let parts = ["7/parts/0".to_owned(), "7/parts/1".to_owned()];
+        assert_eq!(storage.concat(&parts, "7/merged", 11).await.unwrap(), 11);
+        let mut merged = Vec::new();
+        let mut stream = storage.read("7/merged").await.unwrap();
+        while let Some(chunk) = stream.next().await {
+            merged.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(merged, b"hello world");
+
+        // A length mismatch or a missing source leaves no object behind.
+        assert!(storage.concat(&parts, "8/merged", 12).await.is_err());
+        let missing = ["7/parts/0".to_owned(), "7/parts/2".to_owned()];
+        assert!(storage.concat(&missing, "9/merged", 6).await.is_err());
+        assert!(!storage.exists("8/merged").await.unwrap());
+        assert!(!storage.exists("9/merged").await.unwrap());
+        assert_eq!(storage.list_storage_folders().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

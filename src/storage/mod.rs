@@ -19,8 +19,7 @@ use sea_orm::{
     Order, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait, TransactionTrait,
 };
 use serde::Serialize;
-use tokio::sync::{mpsc, oneshot};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::oneshot;
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
@@ -224,24 +223,20 @@ impl Storage {
     where
         S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
     {
-        let Some(folder_name) = upload::Entity::find_by_id(upload_id)
-            .select_only()
-            .column(upload::Column::FolderName)
-            .into_tuple::<String>()
-            .one(&self.db)
-            .await?
-        else {
-            return Ok(false);
-        };
-
-        upload::Entity::update_many()
+        // Counting the started Part also finds the Upload, in one round trip.
+        let Some(upload) = upload::Entity::update_many()
             .col_expr(
                 upload::Column::StartedPartUploadCount,
                 Expr::col(upload::Column::StartedPartUploadCount).add(1),
             )
             .filter(upload::Column::Id.eq(upload_id))
-            .exec(&self.db)
-            .await?;
+            .exec_with_returning(&self.db)
+            .await?
+            .pop()
+        else {
+            return Ok(false);
+        };
+        let folder_name = upload.folder_name;
 
         self.fs
             .write(&part_name(&folder_name, index), body, None)
@@ -402,20 +397,10 @@ impl Storage {
             }
         }
 
-        if self.config.eager_merge {
-            // Filesystem storage has no Server-side Merge, so an Eager Merge
-            // always streams the Parts (ADR-0009).
-            let fs = self.fs.clone();
-            let folder_name = location.folder_name.clone();
-            let size = location.size_bytes.cast_unsigned();
-            let parts = stream_parts(fs.clone(), folder_name.clone(), location.part_count);
-            let write = async move {
-                fs.write(&merged_name(&folder_name), parts, Some(size))
-                    .await
-            };
-            if let Err(err) = self.start_merge(&location, write).await {
-                tracing::warn!(error = %err, "Eager Merge failed to start after upload completion");
-            }
+        if self.config.eager_merge
+            && let Err(err) = self.start_merge(&location).await
+        {
+            tracing::warn!(error = %err, "Eager Merge failed to start after upload completion");
         }
 
         Ok(Some(upload.id))
@@ -521,8 +506,8 @@ impl Storage {
     }
 
     /// Starts a proxied download, taking a Storage Reader Lease for its
-    /// lifetime. The first download of an unmerged entry also performs the
-    /// Merge, feeding the same Part bytes to the client and the merged object.
+    /// lifetime. The first download of an unmerged entry also starts the
+    /// Merge, which runs on its own while the download streams the Parts.
     /// `None` when the entry doesn't exist or its data is gone.
     ///
     /// # Errors
@@ -549,17 +534,16 @@ impl Storage {
             ReaderScope::Parts
         };
         let lease_id = leases::create_reader_lease(&txn, location.id, scope).await?;
-        txn.commit().await?;
-
-        // A Cache Access, for Cache Recency.
+        // A Cache Access, for Cache Recency, on the row already locked.
         storage_location::Entity::update_many()
             .col_expr(
                 storage_location::Column::LastDownloadedAt,
                 Expr::value(Utc::now()),
             )
             .filter(storage_location::Column::Id.eq(location.id))
-            .exec(&self.db)
+            .exec(&txn)
             .await?;
+        txn.commit().await?;
 
         match self.open_location(&location).await {
             Ok(Some(stream)) => Ok(Some(Download {
@@ -596,33 +580,14 @@ impl Storage {
         if self.fs.count_files(&parts).await? < usize::try_from(location.part_count).unwrap_or(0) {
             return Err(StorageError::NotFound(parts).into());
         }
-
-        let (merger_sender, merger_receiver) = mpsc::channel::<std::io::Result<Bytes>>(2);
-        let fs = self.fs.clone();
-        let name = merged_name(&location.folder_name);
-        let size = location.size_bytes.cast_unsigned();
-        let write = async move {
-            fs.write(&name, ReceiverStream::new(merger_receiver), Some(size))
-                .await
-        };
-        if !self.start_merge(location, write).await? {
-            // Someone else is merging: read the Parts, which our Part Reader
-            // Lease protects until we're done.
-            return Ok(Some(stream_parts(
-                self.fs.clone(),
-                location.folder_name.clone(),
-                location.part_count,
-            )));
-        }
-
-        let (response_sender, response_receiver) = mpsc::channel::<std::io::Result<Bytes>>(2);
-        let parts = stream_parts(
+        // Whether this download starts the Merge or another worker holds the
+        // Merge Lease, our Part Reader Lease protects the Parts we stream.
+        self.start_merge(location).await?;
+        Ok(Some(stream_parts(
             self.fs.clone(),
             location.folder_name.clone(),
             location.part_count,
-        );
-        tokio::spawn(pump_parts(parts, response_sender, merger_sender));
-        Ok(Some(Box::pin(ReceiverStream::new(response_receiver))))
+        )))
     }
 
     /// Ties a Storage Reader Lease to a download stream: renewed while the
@@ -687,15 +652,12 @@ impl Storage {
         })
     }
 
-    /// Runs a Merge under a Merge Lease. `write` produces the merged object;
-    /// a lease-fenced transaction then marks the Merge complete. Returns false
-    /// when another worker holds the lease. Writing straight to the final
-    /// object is safe because Parts are immutable (ADR-0004). The background
-    /// task never fails: errors are logged and the merge state rolled back.
-    async fn start_merge<W>(&self, location: &storage_location::Model, write: W) -> Result<bool>
-    where
-        W: Future<Output = Result<u64, StorageError>> + Send + 'static,
-    {
+    /// Runs a Merge under a Merge Lease in the background: the Parts are
+    /// concatenated into the merged object inside the kernel, then a
+    /// lease-fenced transaction marks the Merge complete. Returns false when
+    /// another worker holds the lease. The background task never fails:
+    /// errors are logged and the merge state rolled back.
+    async fn start_merge(&self, location: &storage_location::Model) -> Result<bool> {
         let location_id = location.id;
         let Some(token) = leases::acquire_merge_lease(&self.db, location_id).await? else {
             return Ok(false);
@@ -709,6 +671,12 @@ impl Storage {
             .exec(&self.db)
             .await?;
 
+        let fs = self.fs.clone();
+        let parts: Vec<String> = (0..location.part_count as u32)
+            .map(|index| part_name(&location.folder_name, index))
+            .collect();
+        let merged = merged_name(&location.folder_name);
+        let size = location.size_bytes as u64;
         let db = self.db.clone();
         self.merges.spawn(async move {
             let renewal = {
@@ -729,7 +697,9 @@ impl Storage {
             };
 
             let result = async {
-                write.await?;
+                // Parts are immutable (ADR-0004) and the merged object only
+                // becomes visible once its length is verified.
+                fs.concat(&parts, &merged, size).await?;
                 // The merged object is already written, so losing a deadlock
                 // here must not throw the merge away; the fence is re-checked
                 // on every attempt.
@@ -920,61 +890,6 @@ async fn rollback_merge(
         .exec(db)
         .await?;
     Ok(())
-}
-
-/// Feeds Part bytes to both the client and the merger, each with
-/// backpressure. A client that goes away doesn't stop the merge; a merger
-/// failure doesn't stop the client. A read error is passed to both, so the
-/// merger never mistakes a truncated stream for a complete one (it also checks
-/// the byte count).
-async fn pump_parts(
-    mut parts: ByteStream,
-    response: mpsc::Sender<std::io::Result<Bytes>>,
-    merger: mpsc::Sender<std::io::Result<Bytes>>,
-) {
-    let mut response = Some(response);
-    let mut merger = Some(merger);
-    while let Some(chunk) = parts.next().await {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(err) => {
-                let message = err.to_string();
-                if let Some(response) = &response {
-                    let _ = response
-                        .send(Err(std::io::Error::new(err.kind(), message.clone())))
-                        .await;
-                }
-                if let Some(merger) = &merger {
-                    let _ = merger
-                        .send(Err(std::io::Error::new(err.kind(), message)))
-                        .await;
-                }
-                return;
-            }
-        };
-        let to_response = async {
-            match &response {
-                Some(sender) => sender.send(Ok(chunk.clone())).await.is_ok(),
-                None => false,
-            }
-        };
-        let to_merger = async {
-            match &merger {
-                Some(sender) => sender.send(Ok(chunk.clone())).await.is_ok(),
-                None => false,
-            }
-        };
-        let (response_open, merger_open) = tokio::join!(to_response, to_merger);
-        if !response_open {
-            response = None;
-        }
-        if !merger_open {
-            merger = None;
-        }
-        if response.is_none() && merger.is_none() {
-            return;
-        }
-    }
 }
 
 /// Stops renewing and releases a Storage Reader Lease when its download stream
