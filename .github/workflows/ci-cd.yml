@@ -54,13 +54,70 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
 
+  nix:
+    name: ❄️ Nix flake
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Enable KVM for the NixOS VM test
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: cachix/install-nix-action@v31
+      # Builds the package and runs the NixOS module test (nix/test.nix).
+      - run: nix flake check -L
+
+  docker:
+    name: 🐳 Docker image (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - uses: actions/checkout@v6
+      # Only to run the arm64 image below; the build itself cross-compiles.
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: cache-server:ci
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+      - name: Run the binary
+        run: |
+          # Without configuration the server must start, then refuse to run.
+          output=$(docker run --rm --platform ${{ matrix.platform }} cache-server:ci 2>&1) && exit 1
+          echo "$output"
+          grep -q "API_BASE_URL is required" <<< "$output"
+
+  helm:
+    name: ⎈ Helm chart
+    runs-on: ubuntu-latest
+    env:
+      CHART_DIR: install/kubernetes/github-actions-cache-server
+    steps:
+      - uses: actions/checkout@v6
+      - uses: azure/setup-helm@v4
+      - run: helm lint "$CHART_DIR" --set config.db.postgres.url=postgres://cache@db/cache
+      - run: |
+          helm template ci "$CHART_DIR" --set config.db.postgres.url=postgres://cache@db/cache > /dev/null
+          helm template ci "$CHART_DIR" --set config.db.postgres.host=db --set replicaCount=3 > /dev/null
+          # A release without a database must be rejected.
+          ! helm template ci "$CHART_DIR" > /dev/null 2>&1
+      - run: helm package "$CHART_DIR" --destination packaged
+
   deploy:
     if: github.event.ref == 'refs/heads/dev'
     name: 🚀 Build and push
     permissions:
       packages: write
       contents: read
-    needs: [lint, test]
+    needs: [lint, test, nix, docker, helm]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

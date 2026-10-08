@@ -38,6 +38,37 @@ volumes:
   postgres-data:
 ```
 
+## NixOS
+
+The flake provides a package, an overlay and a NixOS module. By default the module also sets up a local PostgreSQL database, reached over its Unix socket.
+
+```nix
+{
+  inputs.github-actions-cache-server.url = "github:falcondev-oss/github-actions-cache-server";
+
+  outputs = { nixpkgs, github-actions-cache-server, ... }: {
+    nixosConfigurations.cache = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        github-actions-cache-server.nixosModules.default
+        {
+          services.github-actions-cache-server = {
+            enable = true;
+            apiBaseUrl = "https://cache.example.com";
+            openFirewall = true;
+            settings.CACHE_MAX_SIZE_BYTES = 100 * 1024 * 1024 * 1024;
+            # MANAGEMENT_API_KEY=... and other secrets
+            environmentFile = "/run/secrets/github-actions-cache-server.env";
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+Cache data lives in `/var/lib/github-actions-cache-server/storage` (`storagePath`). To use an existing database instead, set `database.createLocally = false` and provide `DB_POSTGRES_URL` through `database.url` or `environmentFile`. The service's systemd sandbox allows io_uring. `nix develop` gives a shell with the Rust toolchain, PostgreSQL and Helm.
+
 ## Configuration
 
 | Variable                                                                                                  | Default                                                  | Description                                                                                                                                                        |
