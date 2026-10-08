@@ -13,48 +13,134 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  lint:
-    name: 💅 Lint
+  rust:
+    name: 🦀 ${{ matrix.name }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Format
+            components: rustfmt
+            run: cargo fmt --all --check
+          # Pedantic lints are enabled in Cargo.toml's [lints.clippy], so local
+          # `cargo clippy` runs match CI.
+          - name: Clippy (pedantic)
+            components: clippy
+            cache-key: clippy
+            run: |
+              cargo clippy --all-targets --all-features --locked -- -D warnings
+              cargo clippy --all-targets --no-default-features --locked -- -D warnings
+          - name: Check
+            cache-key: check
+            run: |
+              cargo check --all-targets --all-features --locked
+              cargo check --all-targets --no-default-features --locked
+          - name: Test (io_uring on)
+            cache-key: test
+            postgres: postgres:17
+            io-uring: true
+            # The load benchmarks run in quick mode to keep them working; their
+            # numbers need a quiet machine.
+            run: |
+              cargo test --locked
+              cargo bench --bench workloads --locked -- --quick
+          - name: Test (io_uring off)
+            cache-key: test
+            postgres: postgres:17
+            io-uring: false
+            run: cargo test --locked
+    services:
+      postgres:
+        # An empty image skips the service for entries that don't need it.
+        image: ${{ matrix.postgres || '' }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      STORAGE_FILESYSTEM_IO_URING: ${{ matrix.io-uring }}
     steps:
-      - name: pnpm install
-        uses: falcondev-it/.github/actions/pnpm-install@master
-
-      - name: Cache ESLint & Prettier
-        uses: actions/cache@v5
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          path: |
-            .eslintcache
-            node_modules/.cache/prettier/.prettier-cache
-          key: eslint-prettier-cache-${{ runner.os }}
+          components: ${{ matrix.components }}
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.cache-key
+        with:
+          key: ${{ matrix.cache-key }}
+      - run: ${{ matrix.run }}
 
-      - run: pnpm run lint:ci
-
-  type-check:
-    name: 🛃 Type Check
+  scripts:
+    name: 🐍 Release scripts
     runs-on: ubuntu-latest
     steps:
-      - name: pnpm install
-        uses: falcondev-it/.github/actions/pnpm-install@master
+      - uses: actions/checkout@v6
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
 
-      - run: pnpm run type-check
+  nix:
+    name: ❄️ Nix flake
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Enable KVM for the NixOS VM test
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: cachix/install-nix-action@v31
+      # Builds the package and runs the NixOS module test (nix/test.nix).
+      - run: nix flake check -L
 
-  test-unit:
-    name: 🧪 Unit Tests
+  docker:
+    name: 🐳 Docker image (${{ matrix.platform }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        storage-driver: [filesystem, s3, gcs]
-        db-driver: [postgres, mysql, sqlite]
+        platform: [linux/amd64, linux/arm64]
     steps:
-      - name: pnpm install
-        uses: falcondev-it/.github/actions/pnpm-install@master
+      - uses: actions/checkout@v6
+      # Only to run the arm64 image below; the build itself cross-compiles.
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: cache-server:ci
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+      - name: Run the binary
+        run: |
+          # Without configuration the server must start, then refuse to run.
+          output=$(docker run --rm --platform ${{ matrix.platform }} cache-server:ci 2>&1) && exit 1
+          echo "$output"
+          grep -q "API_BASE_URL is required" <<< "$output"
 
-      - run: pnpm run test:run
-        env:
-          VITEST_DB_DRIVER: ${{ matrix.db-driver }}
-          VITEST_STORAGE_DRIVER: ${{ matrix.storage-driver }}
+  helm:
+    name: ⎈ Helm chart
+    runs-on: ubuntu-latest
+    env:
+      CHART_DIR: install/kubernetes/github-actions-cache-server
+    steps:
+      - uses: actions/checkout@v6
+      - uses: azure/setup-helm@v4
+      - run: helm lint "$CHART_DIR" --set config.db.postgres.url=postgres://cache@db/cache
+      - run: |
+          helm template ci "$CHART_DIR" --set config.db.postgres.url=postgres://cache@db/cache > /dev/null
+          helm template ci "$CHART_DIR" --set config.db.postgres.host=db --set replicaCount=3 > /dev/null
+          # A release without a database must be rejected.
+          ! helm template ci "$CHART_DIR" > /dev/null 2>&1
+      - run: helm package "$CHART_DIR" --destination packaged
 
   deploy:
     if: github.event.ref == 'refs/heads/dev'
@@ -62,7 +148,7 @@ jobs:
     permissions:
       packages: write
       contents: read
-    needs: [lint, type-check, test-unit]
+    needs: [rust, scripts, nix, docker, helm]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -104,23 +190,3 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             BUILD_HASH=${{ steps.build_hash.outputs.COMMIT_SHA }}
-
-      - name: Extract metadata (tags, labels) for Docker (caged)
-        id: meta-caged
-        uses: docker/metadata-action@v6
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            dev-caged
-
-      - name: Build and push (caged)
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta-caged.outputs.tags }}
-          labels: ${{ steps.meta-caged.outputs.labels }}
-          build-args: |
-            BUILD_HASH=${{ steps.build_hash.outputs.COMMIT_SHA }}
-            BASE_IMAGE=platformatic/node-caged:26-alpine
