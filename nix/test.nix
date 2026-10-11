@@ -43,7 +43,7 @@
     machine.wait_for_open_port(3000)
     assert machine.succeed("curl -sSf http://localhost:3000/health") == "healthy"
     # The systemd sandbox must leave io_uring usable.
-    machine.succeed("journalctl -u github-actions-cache-server | grep -q 'uses io_uring'")
+    machine.succeed("journalctl -u github-actions-cache-server | grep -q 'Connections and file I/O use io_uring'")
 
     with subtest("save a cache entry"):
         created = twirp("CreateCacheEntry", {"key": "nixos-key", "version": "v1"})

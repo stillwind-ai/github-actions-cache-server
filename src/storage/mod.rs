@@ -22,12 +22,12 @@ use sea_orm::{
     JoinType, Order, QueryFilter, QueryOrder, QuerySelect, RelationTrait, TransactionTrait,
 };
 use serde::Serialize;
-use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 use self::backend::{Backend, StorageError};
-use self::io::ByteStream;
+use self::io::{ByteStream, FileBody, FileSegment};
 use self::leases::LEASE_RENEWAL;
 use self::lifecycle::{delete_storage_location_if_unread, no_active_reader_lease};
 use crate::config::Config;
@@ -83,6 +83,15 @@ pub struct MatchQuery<'a> {
 pub struct Download {
     pub size: u64,
     pub stream: ByteStream,
+    /// On filesystem storage, the files holding the same bytes as `stream`,
+    /// for a server that can send them without reading them (splice).
+    pub files: Option<FileBody>,
+}
+
+/// Where a download's bytes come from.
+enum Content {
+    Stream(ByteStream),
+    Files(Vec<FileSegment>),
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -561,10 +570,28 @@ impl Storage {
         };
 
         match self.open_location(&location).await {
-            Ok(Some(stream)) => Ok(Some(Download {
-                size: location.size_bytes.cast_unsigned(),
-                stream: self.protect_download(stream, lease_id),
-            })),
+            Ok(Some(content)) => {
+                let size = location.size_bytes.cast_unsigned();
+                let lease = ReaderLease::start(self.db.clone(), lease_id);
+                let (stream, files) = match (content, &self.backend) {
+                    (Content::Files(segments), Backend::Filesystem(fs)) => {
+                        let lost = lease.lost.clone();
+                        let files = FileBody::new(segments, size, lease.clone(), move || {
+                            lost.borrow().clone()
+                        });
+                        (fs.io().read_segments(&files), Some(files))
+                    }
+                    (Content::Files(_), Backend::S3(_)) => {
+                        unreachable!("only filesystem storage has files")
+                    }
+                    (Content::Stream(stream), _) => (stream, None),
+                };
+                Ok(Some(Download {
+                    size,
+                    stream: protect_download(stream, lease),
+                    files,
+                }))
+            }
             result => {
                 if let Err(err) = leases::release_reader_lease(&self.db, lease_id).await {
                     tracing::warn!(%lease_id, error = %err, "Failed to release Storage Reader Lease");
@@ -581,16 +608,16 @@ impl Storage {
         }
     }
 
-    async fn open_location(
-        &self,
-        location: &storage_location::Model,
-    ) -> Result<Option<ByteStream>> {
+    async fn open_location(&self, location: &storage_location::Model) -> Result<Option<Content>> {
         if location.merged_at.is_some() {
-            return Ok(Some(
-                self.backend
-                    .read(&merged_name(&location.folder_name))
-                    .await?,
-            ));
+            let merged = merged_name(&location.folder_name);
+            return Ok(Some(match &self.backend {
+                Backend::Filesystem(fs) => {
+                    let (file, size) = fs.open(&merged).await?;
+                    Content::Files(vec![FileSegment::Open(file, size)])
+                }
+                Backend::S3(_) => Content::Stream(self.backend.read(&merged).await?),
+            }));
         }
 
         let parts = parts_folder(&location.folder_name);
@@ -602,73 +629,21 @@ impl Storage {
         // Whether this download starts the Merge or another worker holds the
         // Merge Lease, our Part Reader Lease protects the Parts we stream.
         self.start_merge(location).await?;
-        Ok(Some(stream_parts(
-            self.backend.clone(),
-            location.folder_name.clone(),
-            location.part_count,
-        )))
-    }
-
-    /// Ties a Storage Reader Lease to a download stream: renewed while the
-    /// stream is alive, released when it ends or is dropped, and the stream
-    /// fails if the lease is lost.
-    fn protect_download(&self, stream: ByteStream, lease_id: Uuid) -> ByteStream {
-        let (lost_sender, mut lost) = oneshot::channel::<String>();
-        let db = self.db.clone();
-        let renewal = tokio::spawn(async move {
-            let mut interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + LEASE_RENEWAL,
-                LEASE_RENEWAL,
-            );
-            loop {
-                interval.tick().await;
-                match leases::renew_reader_lease(&db, lease_id).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        let _ = lost_sender.send("Storage Reader Lease was lost".into());
-                        return;
-                    }
-                    Err(err) => {
-                        let _ = lost_sender
-                            .send(format!("Failed to renew Storage Reader Lease: {err}"));
-                        return;
-                    }
-                }
-            }
-        });
-        let guard = ReaderLeaseGuard {
-            db: self.db.clone(),
-            lease_id,
-            renewal,
-        };
-
-        Box::pin(async_stream::stream! {
-            let _guard = guard;
-            let mut stream = stream;
-            let mut watching = true;
-            loop {
-                let item = if watching {
-                    tokio::select! {
-                        biased;
-                        lost_reason = &mut lost => if let Ok(reason) = lost_reason {
-                            yield Err(std::io::Error::other(reason));
-                            break;
-                        } else {
-                            // The renewal task ended without reporting a loss.
-                            watching = false;
-                            continue;
-                        },
-                        item = stream.next() => item,
-                    }
-                } else {
-                    stream.next().await
-                };
-                match item {
-                    Some(item) => yield item,
-                    None => break,
-                }
-            }
-        })
+        Ok(Some(match &self.backend {
+            Backend::Filesystem(fs) => Content::Files(
+                (0..location.part_count.cast_unsigned())
+                    .map(|index| {
+                        fs.object_path(&part_name(&location.folder_name, index))
+                            .map(FileSegment::Path)
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            Backend::S3(_) => Content::Stream(stream_parts(
+                self.backend.clone(),
+                location.folder_name.clone(),
+                location.part_count,
+            )),
+        }))
     }
 
     /// Runs a Merge under a Merge Lease in the background: the Parts are
@@ -982,13 +957,53 @@ async fn rollback_merge(
 
 /// Stops renewing and releases a Storage Reader Lease when its download stream
 /// is dropped, whether it finished, failed or the client went away.
-struct ReaderLeaseGuard {
+/// A download's Storage Reader Lease: renewed while the download is alive,
+/// released when it is dropped. `lost` turns to the reason once the lease
+/// can't be renewed, and the download must stop.
+struct ReaderLease {
     db: DatabaseConnection,
     lease_id: Uuid,
     renewal: tokio::task::JoinHandle<()>,
+    lost: watch::Receiver<Option<String>>,
 }
 
-impl Drop for ReaderLeaseGuard {
+impl ReaderLease {
+    fn start(db: DatabaseConnection, lease_id: Uuid) -> Arc<Self> {
+        let (lost_sender, lost) = watch::channel(None);
+        let renewal = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval_at(
+                    tokio::time::Instant::now() + LEASE_RENEWAL,
+                    LEASE_RENEWAL,
+                );
+                loop {
+                    interval.tick().await;
+                    match leases::renew_reader_lease(&db, lease_id).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let _ = lost_sender.send(Some("Storage Reader Lease was lost".into()));
+                            return;
+                        }
+                        Err(err) => {
+                            let _ = lost_sender
+                                .send(Some(format!("Failed to renew Storage Reader Lease: {err}")));
+                            return;
+                        }
+                    }
+                }
+            })
+        };
+        Arc::new(Self {
+            db,
+            lease_id,
+            renewal,
+            lost,
+        })
+    }
+}
+
+impl Drop for ReaderLease {
     fn drop(&mut self) {
         self.renewal.abort();
         let db = self.db.clone();
@@ -1002,6 +1017,46 @@ impl Drop for ReaderLeaseGuard {
             });
         }
     }
+}
+
+/// Ties a download stream to its lease: the lease lives as long as the
+/// stream, and the stream fails once the lease is lost.
+fn protect_download(stream: ByteStream, lease: Arc<ReaderLease>) -> ByteStream {
+    let mut lost = lease.lost.clone();
+    Box::pin(async_stream::stream! {
+        let _lease = lease;
+        let mut stream = stream;
+        let mut watching = true;
+        loop {
+            let item = if watching {
+                tokio::select! {
+                    biased;
+                    changed = lost.changed() => {
+                        let reason = lost.borrow_and_update().clone();
+                        match (changed, reason) {
+                            (Ok(()), Some(reason)) => {
+                                yield Err(std::io::Error::other(reason));
+                                break;
+                            }
+                            (Ok(()), None) => continue,
+                            // The renewal ended without reporting a loss.
+                            (Err(_), _) => {
+                                watching = false;
+                                continue;
+                            }
+                        }
+                    },
+                    item = stream.next() => item,
+                }
+            } else {
+                stream.next().await
+            };
+            match item {
+                Some(item) => yield item,
+                None => break,
+            }
+        }
+    })
 }
 
 #[cfg(test)]

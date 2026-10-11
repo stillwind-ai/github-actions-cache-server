@@ -4,6 +4,7 @@
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
@@ -40,6 +41,32 @@ impl FsStorage {
     #[must_use]
     pub fn io(&self) -> &FileIo {
         &self.io
+    }
+
+    /// The path of an object.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidName`] for a name outside the storage root.
+    pub fn object_path(&self, name: &str) -> Result<PathBuf, StorageError> {
+        self.path(name)
+    }
+
+    /// Opens an object for reading, returning it with its size.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::NotFound`] when the object doesn't exist,
+    /// [`StorageError::InvalidName`] for a name outside the storage root, or the
+    /// underlying I/O error.
+    pub async fn open(&self, name: &str) -> Result<(Arc<std::fs::File>, u64), StorageError> {
+        match self.io.open(self.path(name)?).await {
+            Ok(opened) => Ok(opened),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                Err(StorageError::NotFound(name.to_owned()))
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// Resolves an object name (`folder/parts/0`) inside the root. Names are

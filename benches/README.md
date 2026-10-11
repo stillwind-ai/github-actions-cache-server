@@ -20,7 +20,7 @@ Each scenario starts a fresh server (the release binary of this checkout) on a f
 | `BENCH_FULL=1` | include the captured archives over 512 MiB (react's 908 MiB yarn cache, typst's 1 GiB rust-cache) |
 | `BENCH_COLD=1` | drop the page cache between setup and run, so reads hit the disk (needs root) |
 | `BENCH_STORAGE_DIR` | where storage directories go (default: the system temp dir) |
-| `STORAGE_FILESYSTEM_IO_URING=false`, … | server variables pass through |
+| `IO_URING=false`, … | server variables pass through |
 
 Comparing two builds: `BENCH_SERVER_BIN=../base/target/release/github-actions-cache-server BENCH_JSON=base.json cargo bench`, then `BENCH_COMPARE=base.json cargo bench`. Interleave and repeat runs on a noisy machine; wall times on shared VMs vary by tens of percent, CPU time and peak RSS much less.
 

@@ -11,7 +11,7 @@
 //! `BENCH_JSON=out.json` saves the results and `BENCH_COMPARE=out.json`
 //! prints the change against a saved run; `BENCH_SERVER_BIN` benchmarks
 //! another build, `BENCH_DB_RTT_MS=1` puts the database a 1 ms round trip
-//! away, and server variables such as `STORAGE_FILESYSTEM_IO_URING` pass
+//! away, and server variables such as `IO_URING` pass
 //! through.
 
 // Report arithmetic: f64 is exact far beyond any size or time measured here.

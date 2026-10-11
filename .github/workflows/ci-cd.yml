@@ -82,7 +82,7 @@ jobs:
           --health-cmd "curl -fsS http://localhost:9000/health" --health-interval 2s --health-timeout 5s --health-retries 30
     env:
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
-      STORAGE_FILESYSTEM_IO_URING: ${{ matrix.io-uring }}
+      IO_URING: ${{ matrix.io-uring }}
       TEST_STORAGE_DRIVER: ${{ matrix.storage-driver }}
       TEST_S3_ENDPOINT: http://localhost:9000
       TEST_S3_ACCESS_KEY_ID: access_key

@@ -38,10 +38,11 @@ pub struct Config {
 
     pub storage_driver: StorageDriver,
     pub storage_filesystem_path: PathBuf,
-    /// Use `io_uring` for filesystem storage I/O when the kernel allows it.
-    pub storage_filesystem_io_uring: bool,
-    /// Number of `io_uring` worker threads, each running its own ring.
-    pub storage_filesystem_io_uring_threads: usize,
+    /// Serve connections and do filesystem storage I/O through `io_uring`
+    /// when the kernel allows it.
+    pub io_uring: bool,
+    /// Number of `io_uring` threads, each running its own ring.
+    pub io_uring_threads: usize,
 
     /// Delete cache entries not saved or accessed for this many days. 0 disables.
     pub cache_cleanup_older_than_days: f64,
@@ -176,11 +177,20 @@ impl Config {
                 .get("STORAGE_FILESYSTEM_PATH")
                 .unwrap_or(".data/storage/filesystem")
                 .into(),
-            storage_filesystem_io_uring: env.bool("STORAGE_FILESYSTEM_IO_URING")?.unwrap_or(true),
-            storage_filesystem_io_uring_threads: env
-                .parsed::<usize>("STORAGE_FILESYSTEM_IO_URING_THREADS")?
-                .unwrap_or(2)
-                .max(1),
+            // The STORAGE_FILESYSTEM_ names predate io_uring for connections.
+            io_uring: match env.bool("IO_URING")? {
+                Some(enabled) => enabled,
+                None => env.bool("STORAGE_FILESYSTEM_IO_URING")?.unwrap_or(true),
+            },
+            io_uring_threads: match env.parsed::<usize>("IO_URING_THREADS")? {
+                Some(threads) => threads,
+                None => env
+                    .parsed::<usize>("STORAGE_FILESYSTEM_IO_URING_THREADS")?
+                    .unwrap_or_else(|| {
+                        std::thread::available_parallelism().map_or(2, std::num::NonZero::get)
+                    }),
+            }
+            .max(1),
             cache_cleanup_older_than_days,
             cache_max_size_bytes,
             cache_filesystem_max_usage_percent,
@@ -382,6 +392,31 @@ mod tests {
         .unwrap();
         assert!(matches!(config.storage_driver, StorageDriver::Filesystem));
         assert!(!config.enable_direct_downloads);
+    }
+
+    #[test]
+    fn io_uring_settings_keep_their_old_names() {
+        let base = [
+            ("API_BASE_URL", "http://localhost:3000"),
+            ("DB_POSTGRES_URL", "postgres://localhost/db"),
+        ];
+        let config = Config::from_vars(vars(&base)).unwrap();
+        assert!(config.io_uring);
+        assert!(config.io_uring_threads >= 1);
+
+        let mut env = vars(&base);
+        env.insert("STORAGE_FILESYSTEM_IO_URING".into(), "false".into());
+        env.insert("STORAGE_FILESYSTEM_IO_URING_THREADS".into(), "3".into());
+        let config = Config::from_vars(env.clone()).unwrap();
+        assert!(!config.io_uring);
+        assert_eq!(config.io_uring_threads, 3);
+
+        // The new names win.
+        env.insert("IO_URING".into(), "true".into());
+        env.insert("IO_URING_THREADS".into(), "0".into());
+        let config = Config::from_vars(env).unwrap();
+        assert!(config.io_uring);
+        assert_eq!(config.io_uring_threads, 1);
     }
 
     #[test]
