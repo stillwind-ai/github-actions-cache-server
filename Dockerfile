@@ -1,8 +1,25 @@
 # syntax=docker/dockerfile:1
 
-# The builder always runs on the build host and cross-compiles for the target
+# The Rust stages always run on the build host and cross-compile for the target
 # platform, so multi-platform images don't compile Rust under QEMU emulation.
-FROM --platform=$BUILDPLATFORM rust:1.97-bookworm AS builder
+#
+# cargo-chef splits the build in two: dependencies are compiled in a layer that
+# only depends on Cargo.toml and Cargo.lock, so a source-only change reuses it.
+# Unlike a cache mount, that layer is exported to the registry/GHA build cache.
+FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:0.1.78-rust-1.97-bookworm AS chef
+WORKDIR /app
+
+# --------------------------------------------
+
+# Reduces the manifests to a recipe; it stays the same as long as the
+# dependencies do, whatever else changed in the context.
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# --------------------------------------------
+
+FROM chef AS builder
 
 ARG BUILDARCH
 ARG TARGETARCH
@@ -28,16 +45,18 @@ ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
 
-WORKDIR /app
+# Dependencies only, with the same profile, target and features as the build
+# below. No cache mounts: the compiled dependencies must land in this layer.
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --locked --target "$(cat /rust-target)" --recipe-path recipe.json
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
+# Declared after the dependency layer so a new hash only rebuilds the crate.
 ARG BUILD_HASH
 ENV BUILD_HASH=${BUILD_HASH}
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/app/target,sharing=locked \
-    target="$(cat /rust-target)" \
+RUN target="$(cat /rust-target)" \
     && cargo build --release --locked --target "$target" \
     && cp "target/$target/release/github-actions-cache-server" /usr/local/bin/
 
