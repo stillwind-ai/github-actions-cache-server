@@ -153,6 +153,12 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Same caches as the dev deploy in ci-cd.yml.
+          cache-from: |
+            type=gha,scope=linux/amd64
+            type=gha,scope=linux/arm64
+            type=gha,scope=deploy
+          cache-to: type=gha,mode=max,scope=deploy
 
   deploy-chart:
     name: 🚀 Build and push Helm chart

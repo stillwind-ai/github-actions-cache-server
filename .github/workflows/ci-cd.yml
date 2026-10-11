@@ -110,6 +110,9 @@ jobs:
       # Only to run the arm64 image below; the build itself cross-compiles.
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
+      - name: Get build hash
+        id: build_hash
+        run: echo "COMMIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
       - name: Build
         uses: docker/build-push-action@v7
         with:
@@ -117,6 +120,9 @@ jobs:
           platforms: ${{ matrix.platform }}
           load: true
           tags: cache-server:ci
+          # Matches the deploy job's build args so it can reuse every layer.
+          build-args: |
+            BUILD_HASH=${{ steps.build_hash.outputs.COMMIT_SHA }}
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
       - name: Run the binary
@@ -190,3 +196,10 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             BUILD_HASH=${{ steps.build_hash.outputs.COMMIT_SHA }}
+          # Starts from the per-platform layers the docker job above just
+          # cached for this commit, so nothing needs to compile again.
+          cache-from: |
+            type=gha,scope=linux/amd64
+            type=gha,scope=linux/arm64
+            type=gha,scope=deploy
+          cache-to: type=gha,mode=max,scope=deploy
