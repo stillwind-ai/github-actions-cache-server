@@ -1,10 +1,17 @@
 {
   description = "Self-hosted GitHub Actions cache server (Postgres + filesystem storage)";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    crane.url = "github:ipetkov/crane";
+  };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      crane,
+    }:
     let
       inherit (nixpkgs) lib;
       systems = [
@@ -13,15 +20,21 @@
       ];
       forAllSystems = f: lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
       buildHash = self.shortRev or self.dirtyShortRev or null;
+      mkPackage =
+        pkgs:
+        pkgs.callPackage ./nix/package.nix {
+          inherit buildHash;
+          craneLib = crane.mkLib pkgs;
+        };
     in
     {
       packages = forAllSystems (pkgs: rec {
-        github-actions-cache-server = pkgs.callPackage ./nix/package.nix { inherit buildHash; };
+        github-actions-cache-server = mkPackage pkgs;
         default = github-actions-cache-server;
       });
 
       overlays.default = final: _prev: {
-        github-actions-cache-server = final.callPackage ./nix/package.nix { inherit buildHash; };
+        github-actions-cache-server = mkPackage final;
       };
 
       # services.github-actions-cache-server; see nix/module.nix for options.
@@ -32,9 +45,7 @@
           { lib, pkgs, ... }:
           {
             imports = [ ./nix/module.nix ];
-            services.github-actions-cache-server.package = lib.mkDefault (
-              pkgs.callPackage ./nix/package.nix { inherit buildHash; }
-            );
+            services.github-actions-cache-server.package = lib.mkDefault (mkPackage pkgs);
           };
         default = github-actions-cache-server;
       };
@@ -45,11 +56,9 @@
       });
 
       devShells = forAllSystems (pkgs: {
-        default = pkgs.mkShell {
-          inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+        # cargo, rustc, clippy and rustfmt, from the toolchain the package builds with.
+        default = (crane.mkLib pkgs).devShell {
           packages = with pkgs; [
-            clippy
-            rustfmt
             rust-analyzer
             postgresql
             kubernetes-helm
