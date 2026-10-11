@@ -88,6 +88,10 @@ jobs:
   nix:
     name: ❄️ Nix flake
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Lets cache-nix-action purge the caches this run supersedes.
+      actions: write
     steps:
       - uses: actions/checkout@v6
       - name: Enable KVM for the NixOS VM test
@@ -96,8 +100,26 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
       - uses: cachix/install-nix-action@v31
+      # The Nix store, kept in the GitHub Actions cache. Before saving, garbage
+      # collection drops everything but the GC roots made below, so the cache
+      # holds what cache.nixos.org can't provide: crane's build of the
+      # dependencies (rebuilt only when Cargo.toml, Cargo.lock or the toolchain
+      # change), the package and the NixOS test result.
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'nix/**', 'Cargo.toml', 'Cargo.lock', 'src/**') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 0
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-
+          purge-created: 0
+          purge-primary-key: never
       # Builds the package and runs the NixOS module test (nix/test.nix).
       - run: nix flake check -L
+      - name: Keep the build results in the cache
+        run: >-
+          nix build .#default.cargoArtifacts .#default .#checks.x86_64-linux.nixos
+          --out-link "$RUNNER_TEMP/gcroots/result"
 
   docker:
     name: 🐳 Docker image (${{ matrix.platform }})
