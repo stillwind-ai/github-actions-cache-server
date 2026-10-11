@@ -147,7 +147,7 @@ pub async fn start_with(overrides: &[(&str, &str)]) -> TestServer {
             vars.insert(key.into(), value);
         }
     }
-    // Lets CI run the suite against both the io_uring and tokio::fs paths.
+    // Lets CI run the suite against both the io_uring and blocking I/O paths.
     if let Ok(io_uring) = std::env::var("STORAGE_FILESYSTEM_IO_URING") {
         vars.insert("STORAGE_FILESYSTEM_IO_URING".into(), io_uring);
     }

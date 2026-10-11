@@ -27,7 +27,7 @@ use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
 
-use super::backend::{ComposeLimits, StorageDeletion, StorageError, StorageFolder, StorageObject};
+use super::backend::{StorageDeletion, StorageError, StorageFolder, StorageObject};
 use super::io::ByteStream;
 
 /// Every key the server writes starts with this prefix and a slash.
@@ -170,13 +170,18 @@ fn part_number(index: usize) -> Result<i32, StorageError> {
     i32::try_from(index + 1).map_err(|_| other(format!("part {index} exceeds S3's part numbers")))
 }
 
-impl S3Storage {
-    pub const COMPOSE_LIMITS: ComposeLimits = ComposeLimits {
-        min_part_bytes: MIN_PART_BYTES,
-        max_part_bytes: MAX_PART_BYTES,
-        max_parts: MAX_PARTS,
-    };
+/// Whether objects of these sizes, in order, can be the parts of a
+/// multipart upload, and so be composed with `UploadPartCopy`: every part but
+/// the last at least 5 MiB, none above 5 GiB, at most 10,000 of them.
+fn composable(sizes: &[u64]) -> bool {
+    !sizes.is_empty()
+        && sizes.len() <= MAX_PARTS
+        && sizes.iter().enumerate().all(|(index, &bytes)| {
+            bytes <= MAX_PART_BYTES && (index == sizes.len() - 1 || bytes >= MIN_PART_BYTES)
+        })
+}
 
+impl S3Storage {
     /// Connects and checks that the bucket exists.
     ///
     /// # Errors
@@ -468,19 +473,93 @@ impl S3Storage {
         Ok(())
     }
 
-    /// Server-side Merge (ADR-0009): `CreateMultipartUpload`, one
-    /// `UploadPartCopy` per Part, `CompleteMultipartUpload`.
+    /// Writes the concatenation of the `sources` objects as `name`. When
+    /// their sizes allow it, this is a Server-side Merge (ADR-0009):
+    /// `CreateMultipartUpload`, one `UploadPartCopy` per source,
+    /// `CompleteMultipartUpload`, with no bytes passing through the server.
+    /// Otherwise the sources are streamed into [`Self::write`]. Either way the
+    /// total length is checked against `expected_len` before anything is
+    /// visible.
     ///
     /// # Errors
     ///
-    /// If a request fails; the merged object is then left as it was.
-    pub async fn compose_parts(&self, folder: &str, part_count: u32) -> Result<(), StorageError> {
-        let key = self.key(&format!("{folder}/merged"))?;
+    /// [`StorageError::NotFound`] for a missing source, an
+    /// [`io::ErrorKind::InvalidData`] error for a length mismatch, or a failed
+    /// request; the object is then left as it was.
+    pub async fn concat(
+        &self,
+        sources: &[String],
+        name: &str,
+        expected_len: u64,
+    ) -> Result<u64, StorageError> {
+        let sizes = self.sizes(sources).await?;
+        let total: u64 = sizes.iter().sum();
+        if total != expected_len {
+            return Err(StorageError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("sources of {name} hold {total} bytes, expected {expected_len}"),
+            )));
+        }
+        if composable(&sizes) {
+            self.compose(sources, name).await?;
+            return Ok(total);
+        }
+        let this = self.clone();
+        let sources = sources.to_vec();
+        let stream = async_stream::stream! {
+            for source in sources {
+                let mut object = match this.read(&source).await {
+                    Ok(object) => object,
+                    Err(err) => {
+                        yield Err(io::Error::other(err));
+                        return;
+                    }
+                };
+                while let Some(chunk) = object.next().await {
+                    let failed = chunk.is_err();
+                    yield chunk;
+                    if failed {
+                        return;
+                    }
+                }
+            }
+        };
+        Box::pin(self.write(name, stream, Some(expected_len))).await
+    }
+
+    /// The sizes of objects, from one listing per folder they live in.
+    async fn sizes(&self, names: &[String]) -> Result<Vec<u64>, StorageError> {
+        let mut listed = HashMap::<&str, HashMap<String, u64>>::new();
+        let mut sizes = Vec::with_capacity(names.len());
+        for name in names {
+            let (folder, file) = name
+                .rsplit_once('/')
+                .ok_or_else(|| StorageError::InvalidName(name.clone()))?;
+            if !listed.contains_key(folder) {
+                let objects = self.list_folder(folder).await?;
+                listed.insert(
+                    folder,
+                    objects
+                        .into_iter()
+                        .map(|object| (object.name, object.bytes))
+                        .collect(),
+                );
+            }
+            let size = listed[folder]
+                .get(file)
+                .ok_or_else(|| StorageError::NotFound(name.clone()))?;
+            sizes.push(*size);
+        }
+        Ok(sizes)
+    }
+
+    async fn compose(&self, sources: &[String], name: &str) -> Result<(), StorageError> {
+        let key = self.key(name)?;
         let mut upload = self.create_multipart_upload(&key).await?;
         let result = async {
-            for index in 0..part_count {
-                let source = self.key(&format!("{folder}/parts/{index}"))?;
-                let part_number = part_number(index as usize)?;
+            for (index, source) in sources.iter().enumerate() {
+                let source = self.key(source)?;
+                let part_number = part_number(index)?;
                 let copy = self
                     .client
                     .upload_part_copy()
@@ -704,6 +783,23 @@ impl S3Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composes_parts_within_s3_multipart_limits() {
+        const MIB: u64 = 1024 * 1024;
+        assert!(composable(&[5 * MIB, 5 * 1024 * MIB, 1]));
+        assert!(composable(&[1]), "the last part has no minimum");
+        assert!(!composable(&[]));
+        assert!(
+            !composable(&[5 * MIB - 1, 5 * MIB]),
+            "a non-final part is too small"
+        );
+        assert!(
+            !composable(&[5 * MIB, 5 * 1024 * MIB + 1]),
+            "a part is too large"
+        );
+        assert!(!composable(&vec![5 * MIB; MAX_PARTS + 1]), "too many parts");
+    }
 
     #[tokio::test]
     async fn keys_live_under_the_prefix_and_never_escape_it() {

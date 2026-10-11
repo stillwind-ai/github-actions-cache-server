@@ -53,28 +53,6 @@ pub struct FilesystemUsage {
     pub used_bytes: u64,
 }
 
-/// Limits a set of Parts must satisfy for a Server-side Merge (ADR-0009).
-#[derive(Clone, Copy, Debug)]
-pub struct ComposeLimits {
-    /// Every Part but the last must be at least this large.
-    pub min_part_bytes: u64,
-    pub max_part_bytes: u64,
-    pub max_parts: usize,
-}
-
-impl ComposeLimits {
-    /// Whether Parts of these sizes, in order, can be composed.
-    #[must_use]
-    pub fn allows(&self, part_sizes: &[u64]) -> bool {
-        !part_sizes.is_empty()
-            && part_sizes.len() <= self.max_parts
-            && part_sizes.iter().enumerate().all(|(index, &bytes)| {
-                bytes <= self.max_part_bytes
-                    && (index == part_sizes.len() - 1 || bytes >= self.min_part_bytes)
-            })
-    }
-}
-
 #[derive(Clone)]
 pub enum Backend {
     Filesystem(FsStorage),
@@ -172,7 +150,10 @@ impl Backend {
     ///
     /// As for [`Self::list_folder`].
     pub async fn count_files(&self, folder: &str) -> Result<usize, StorageError> {
-        Ok(self.list_folder(folder).await?.len())
+        match self {
+            Self::Filesystem(fs) => fs.count_files(folder).await,
+            Self::S3(s3) => Ok(Box::pin(s3.list_folder(folder)).await?.len()),
+        }
     }
 
     /// Inventory of every top-level folder the server owns.
@@ -200,30 +181,52 @@ impl Backend {
         }
     }
 
-    /// The limits of a Server-side Merge, when the backend has one.
-    #[must_use]
-    pub fn compose_limits(&self) -> Option<ComposeLimits> {
-        match self {
-            Self::Filesystem(_) => None,
-            Self::S3(_) => Some(S3Storage::COMPOSE_LIMITS),
-        }
-    }
-
-    /// Server-side Merge: copies `parts/0..n-1` of a folder into its merged
-    /// object inside the backend, without passing bytes through the server.
-    /// The caller checks [`Self::compose_limits`] first.
+    /// Writes the concatenation of the `sources` objects as `name`, with
+    /// atomic visibility and the length checked against `expected_len`
+    /// before it becomes visible. This is the Merge: on the filesystem the
+    /// data never enters user space (`copy_file_range`, ADR-0011); on S3 it
+    /// is a Server-side Merge when the sources meet S3's multipart limits and
+    /// streamed through the server otherwise (ADR-0009).
     ///
     /// # Errors
     ///
-    /// On filesystem storage, or the backend's error; the merged object is
-    /// then left as it was.
-    pub async fn compose_parts(&self, folder: &str, part_count: u32) -> Result<(), StorageError> {
+    /// [`StorageError::InvalidName`], [`StorageError::NotFound`] or an
+    /// [`io::ErrorKind::NotFound`] error for a missing source, an
+    /// [`io::ErrorKind::InvalidData`] error for a length other than
+    /// `expected_len`, or the backend's error; the object is then left as it
+    /// was.
+    pub async fn concat(
+        &self,
+        sources: &[String],
+        name: &str,
+        expected_len: u64,
+    ) -> Result<u64, StorageError> {
         match self {
-            Self::Filesystem(_) => Err(StorageError::Io(io::Error::new(
+            Self::Filesystem(fs) => fs.concat(sources, name, expected_len).await,
+            Self::S3(s3) => Box::pin(s3.concat(sources, name, expected_len)).await,
+        }
+    }
+
+    /// Whether [`Self::rename`] is available: an atomic, metadata-only rename.
+    #[must_use]
+    pub fn supports_rename(&self) -> bool {
+        matches!(self, Self::Filesystem(_))
+    }
+
+    /// Atomically renames an object, where [`Self::supports_rename`].
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::NotFound`] when `from` doesn't exist,
+    /// [`StorageError::InvalidName`], an [`io::ErrorKind::Unsupported`] error
+    /// on object storage, or the underlying I/O error.
+    pub async fn rename(&self, from: &str, to: &str) -> Result<(), StorageError> {
+        match self {
+            Self::Filesystem(fs) => fs.rename(from, to).await,
+            Self::S3(_) => Err(StorageError::Io(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "filesystem storage has no Server-side Merge",
+                "S3 storage has no atomic rename",
             ))),
-            Self::S3(s3) => Box::pin(s3.compose_parts(folder, part_count)).await,
         }
     }
 
@@ -248,25 +251,5 @@ impl Backend {
             Self::Filesystem(_) => Ok(None),
             Self::S3(s3) => Box::pin(s3.download_url(name, expires_in)).await.map(Some),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn compose_limits_apply_to_all_parts_but_the_last() {
-        let limits = ComposeLimits {
-            min_part_bytes: 5,
-            max_part_bytes: 10,
-            max_parts: 3,
-        };
-        assert!(limits.allows(&[5, 10, 1]));
-        assert!(limits.allows(&[1]));
-        assert!(!limits.allows(&[]));
-        assert!(!limits.allows(&[4, 5]), "a non-final part is too small");
-        assert!(!limits.allows(&[5, 11]), "a part is too large");
-        assert!(!limits.allows(&[5, 5, 5, 5]), "too many parts");
     }
 }
