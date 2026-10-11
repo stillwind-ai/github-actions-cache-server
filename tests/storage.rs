@@ -98,7 +98,7 @@ async fn lists_folders_and_deletes_them() {
     let parts: Vec<_> = parts.iter().map(|o| (o.name.as_str(), o.bytes)).collect();
     assert_eq!(parts, [("0", 5), ("1", 6)]);
     assert_eq!(backend.count_files("12/parts").await.unwrap(), 2);
-    assert!(backend.list_folder("missing").await.unwrap().is_empty());
+    assert_eq!(backend.list_folder("missing").await.unwrap(), []);
 
     let mut folders = server.storage_folders().await;
     folders.sort_by(|a, b| a.folder_name.cmp(&b.folder_name));
