@@ -1,39 +1,54 @@
-ARG BASE_IMAGE=node:26-alpine
+# syntax=docker/dockerfile:1
 
-FROM ${BASE_IMAGE} AS builder
+# The builder always runs on the build host and cross-compiles for the target
+# platform, so multi-platform images don't compile Rust under QEMU emulation.
+FROM --platform=$BUILDPLATFORM rust:1.97-bookworm AS builder
+
+ARG BUILDARCH
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+      amd64) echo x86_64-unknown-linux-gnu > /rust-target ;; \
+      arm64) echo aarch64-unknown-linux-gnu > /rust-target ;; \
+      *) echo "Unsupported target architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && rustup target add "$(cat /rust-target)" \
+    && if [ "$TARGETARCH" != "$BUILDARCH" ]; then \
+      case "$TARGETARCH" in \
+        amd64) toolchain=gcc-x86-64-linux-gnu ;; \
+        arm64) toolchain=gcc-aarch64-linux-gnu ;; \
+      esac; \
+      apt-get update \
+      && apt-get install -y --no-install-recommends "$toolchain" "libc6-dev-$TARGETARCH-cross" \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Linkers and C compilers (for `ring`) per target; the native one already exists.
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
+    CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
 
 WORKDIR /app
 
-RUN --mount=type=cache,target=/root/.npm npm install -g pnpm@latest-11
-
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-
-RUN --mount=type=cache,target=/root/.local/share/pnpm/store pnpm fetch --prod
-RUN --mount=type=cache,target=/root/.local/share/pnpm/store pnpm install --frozen-lockfile --prod --offline
-
-COPY . .
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
 
 ARG BUILD_HASH
 ENV BUILD_HASH=${BUILD_HASH}
-RUN pnpm run build
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/app/target,sharing=locked \
+    target="$(cat /rust-target)" \
+    && cargo build --release --locked --target "$target" \
+    && cp "target/$target/release/github-actions-cache-server" /usr/local/bin/
 
 # --------------------------------------------
 
-FROM ${BASE_IMAGE} AS runner
+# glibc, CA certificates and nothing else.
+FROM gcr.io/distroless/cc-debian12 AS runner
 
-ARG BASE_IMAGE
+COPY --from=builder /usr/local/bin/github-actions-cache-server /usr/local/bin/github-actions-cache-server
 
-ENV NITRO_CLUSTER_WORKERS=1
-ENV NODE_CAGED=false
+ENV PORT=3000
+EXPOSE 3000
 
-WORKDIR /app
-
-COPY --from=builder /app/.output ./
-
-RUN if echo "$BASE_IMAGE" | grep -q "node-caged"; then \
-			echo "export NODE_CAGED=true" > /app/.runtime-env; \
-		else \
-			echo "export NODE_CAGED=false" > /app/.runtime-env; \
-		fi
-
-CMD ["sh", "-c", ". /app/.runtime-env && exec node --expose-gc /app/server/index.mjs"]
+ENTRYPOINT ["/usr/local/bin/github-actions-cache-server"]

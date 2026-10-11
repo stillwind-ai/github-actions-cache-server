@@ -71,13 +71,13 @@ PVC name
 {{/*
 Determine if PVC should be enabled.
 If persistentVolumeClaim.enabled is explicitly set (true/false), use that value.
-Otherwise, auto-enable when storage driver is "filesystem" or db driver is "sqlite".
+Otherwise enabled: cache files live on the volume.
 */}}
 {{- define "github-actions-cache-server.pvcEnabled" -}}
 {{- if kindIs "bool" .Values.persistentVolumeClaim.enabled -}}
   {{- .Values.persistentVolumeClaim.enabled -}}
 {{- else -}}
-  {{- or (eq .Values.config.storage.driver "filesystem") (eq .Values.config.db.driver "sqlite") -}}
+  true
 {{- end -}}
 {{- end }}
 
@@ -94,12 +94,11 @@ false
 
 {{/*
 Effective PVC access modes.
-Automatically switches to ReadWriteMany when multiple replicas are possible
-and the filesystem storage driver is used, to prevent errors when multiple
-pods attach to the same volume.
+Automatically switches to ReadWriteMany when multiple replicas are possible,
+to prevent errors when multiple pods attach to the same volume.
 */}}
 {{- define "github-actions-cache-server.pvcAccessModes" -}}
-{{- if and (eq (include "github-actions-cache-server.multipleReplicas" .) "true") (eq .Values.config.storage.driver "filesystem") -}}
+{{- if eq (include "github-actions-cache-server.multipleReplicas" .) "true" -}}
 - ReadWriteMany
 {{- else -}}
 {{ toYaml .Values.persistentVolumeClaim.accessModes }}
@@ -110,8 +109,10 @@ pods attach to the same volume.
 Validate configuration. Fails if incompatible settings are detected.
 */}}
 {{- define "github-actions-cache-server.validate" -}}
-{{- if and (eq .Values.config.db.driver "sqlite") (eq (include "github-actions-cache-server.multipleReplicas" .) "true") -}}
-{{- fail "SQLite database driver cannot be used with multiple replicas (autoscaling enabled or replicaCount > 1). SQLite does not support concurrent access from multiple pods. Please switch to 'postgres' or 'mysql' database driver." -}}
+{{- with .Values.config.db.postgres }}
+{{- if not (or .url .host $.Values.existingSecret $.Values.extraEnvFrom $.Values.extraEnv) -}}
+{{- fail "A PostgreSQL database is required: set config.db.postgres.url or config.db.postgres.host (or provide DB_POSTGRES_URL via existingSecret)." -}}
+{{- end -}}
 {{- end -}}
 {{- end }}
 
@@ -123,8 +124,6 @@ Generate environment variables from config values.
   value: "3000"
 - name: API_BASE_URL
   value: {{ default (printf "http://%s.%s.svc.cluster.local:%v" (include "github-actions-cache-server.fullname" .) .Release.Namespace .Values.service.port) .Values.config.apiBaseUrl | quote }}
-- name: ENABLE_DIRECT_DOWNLOADS
-  value: {{ .Values.config.enableDirectDownloads | quote }}
 - name: EAGER_MERGE
   value: {{ .Values.config.eagerMerge | quote }}
 - name: CACHE_CLEANUP_OLDER_THAN_DAYS
@@ -149,61 +148,16 @@ Generate environment variables from config values.
 - name: MANAGEMENT_API_KEY
   value: {{ .Values.config.managementApiKey | quote }}
 {{- end }}
-{{/* Storage driver */}}
-- name: STORAGE_DRIVER
-  value: {{ .Values.config.storage.driver | quote }}
-{{- if eq .Values.config.storage.driver "filesystem" }}
 - name: STORAGE_FILESYSTEM_PATH
   value: {{ .Values.config.storage.filesystem.path | quote }}
-{{- else if eq .Values.config.storage.driver "s3" }}
-{{- with .Values.config.storage.s3 }}
-{{- if .bucket }}
-- name: STORAGE_S3_BUCKET
-  value: {{ .bucket | quote }}
-{{- end }}
-{{- if .region }}
-- name: AWS_REGION
-  value: {{ .region | quote }}
-{{- end }}
-{{- if .endpointUrl }}
-- name: AWS_ENDPOINT_URL
-  value: {{ .endpointUrl | quote }}
-{{- end }}
-{{- if .accessKeyId }}
-- name: AWS_ACCESS_KEY_ID
-  value: {{ .accessKeyId | quote }}
-{{- end }}
-{{- if .secretAccessKey }}
-- name: AWS_SECRET_ACCESS_KEY
-  value: {{ .secretAccessKey | quote }}
-{{- end }}
-- name: STORAGE_S3_SOCKET_TIMEOUT_MS
-  value: {{ .socketTimeoutMs | quote }}
-{{- end }}
-{{- else if eq .Values.config.storage.driver "gcs" }}
-{{- with .Values.config.storage.gcs }}
-{{- if .bucket }}
-- name: STORAGE_GCS_BUCKET
-  value: {{ .bucket | quote }}
-{{- end }}
-{{- if .serviceAccountKey }}
-- name: STORAGE_GCS_SERVICE_ACCOUNT_KEY
-  value: {{ .serviceAccountKey | quote }}
-{{- end }}
-{{- if .endpoint }}
-- name: STORAGE_GCS_ENDPOINT
-  value: {{ .endpoint | quote }}
-{{- end }}
-{{- end }}
-{{- end }}
-{{/* Database driver */}}
-- name: DB_DRIVER
-  value: {{ .Values.config.db.driver | quote }}
-{{- if eq .Values.config.db.driver "sqlite" }}
-- name: DB_SQLITE_PATH
-  value: {{ .Values.config.db.sqlite.path | quote }}
-{{- else if eq .Values.config.db.driver "postgres" }}
+- name: STORAGE_FILESYSTEM_IO_URING
+  value: {{ .Values.config.ioUring | quote }}
+{{/* Database */}}
 {{- with .Values.config.db.postgres }}
+{{- if .maxConnections }}
+- name: DB_POSTGRES_MAX_CONNECTIONS
+  value: {{ .maxConnections | quote }}
+{{- end }}
 {{- if .url }}
 - name: DB_POSTGRES_URL
   value: {{ .url | quote }}
@@ -226,30 +180,6 @@ Generate environment variables from config values.
 {{- end }}
 {{- if .password }}
 - name: DB_POSTGRES_PASSWORD
-  value: {{ .password | quote }}
-{{- end }}
-{{- end }}
-{{- end }}
-{{- else if eq .Values.config.db.driver "mysql" }}
-{{- with .Values.config.db.mysql }}
-{{- if .database }}
-- name: DB_MYSQL_DATABASE
-  value: {{ .database | quote }}
-{{- end }}
-{{- if .host }}
-- name: DB_MYSQL_HOST
-  value: {{ .host | quote }}
-{{- end }}
-{{- if .port }}
-- name: DB_MYSQL_PORT
-  value: {{ .port | quote }}
-{{- end }}
-{{- if .user }}
-- name: DB_MYSQL_USER
-  value: {{ .user | quote }}
-{{- end }}
-{{- if .password }}
-- name: DB_MYSQL_PASSWORD
   value: {{ .password | quote }}
 {{- end }}
 {{- end }}
