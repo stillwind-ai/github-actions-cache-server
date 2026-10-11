@@ -29,6 +29,19 @@ fn no_write_scope() -> TwirpError {
     ))
 }
 
+/// Another upload of the same key and version is in progress in this scope.
+/// GitHub answers this with Twirp's `already_exists` (409), not `ok: false`,
+/// and clients rely on the difference: `OpenDAL`, under sccache, maps a 409 to
+/// `ErrorKind::AlreadyExists`, which sccache's startup write check accepts,
+/// but reads `ok: false` as an unexpected failure and drops the whole cache to
+/// read-only. `@actions/cache` handles both the same way.
+fn upload_in_progress() -> TwirpError {
+    TwirpError(ApiError::new(
+        StatusCode::CONFLICT,
+        "An upload of this cache entry is already in progress",
+    ))
+}
+
 pub async fn create_cache_entry(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -43,18 +56,16 @@ pub async fn create_cache_entry(
         .storage
         .create_upload(&key, &version, &scope.scope, &scopes.repo_id)
         .await?;
+    let id = upload.ok_or_else(upload_in_progress)?;
     Ok(TwirpResponse(
         request.format,
-        match upload {
-            Some(id) => CreateCacheEntryResponse {
-                ok: true,
-                signed_upload_url: format!(
-                    "{}/devstoreaccount1/upload/{id}",
-                    state.config.api_base_url
-                ),
-                message: String::new(),
-            },
-            None => CreateCacheEntryResponse::default(),
+        CreateCacheEntryResponse {
+            ok: true,
+            signed_upload_url: format!(
+                "{}/devstoreaccount1/upload/{id}",
+                state.config.api_base_url
+            ),
+            message: String::new(),
         },
     ))
 }

@@ -262,7 +262,8 @@ impl TestServer {
             .unwrap()
     }
 
-    /// `CreateCacheEntry`; the signed upload URL, or `None` for `ok: false`.
+    /// `CreateCacheEntry`; the signed upload URL, or `None` when another
+    /// upload of the entry is in progress (Twirp `already_exists`, 409).
     pub async fn create_entry(&self, key: &str, version: &str) -> Option<String> {
         let response = self
             .twirp(
@@ -270,12 +271,15 @@ impl TestServer {
                 json!({ "key": key, "version": version }),
             )
             .await;
-        assert_eq!(response.status(), 200);
+        let status = response.status();
         let body: Value = response.json().await.unwrap();
-        body["ok"]
-            .as_bool()
-            .unwrap()
-            .then(|| body["signed_upload_url"].as_str().unwrap().to_owned())
+        if status == 409 {
+            assert_eq!(body["code"], "already_exists");
+            return None;
+        }
+        assert_eq!(status, 200);
+        assert_eq!(body["ok"], true);
+        Some(body["signed_upload_url"].as_str().unwrap().to_owned())
     }
 
     pub async fn upload_blocks(&self, upload_url: &str, data: &[u8], block_size: usize) {
