@@ -37,7 +37,7 @@ async fn writes_become_visible_whole_or_not_at_all() {
         .await
         .unwrap();
     assert_eq!(written, data.len() as u64);
-    assert!(server.read_object("1/merged").await.unwrap() == data);
+    assert_eq!(server.read_object("1/merged").await.unwrap(), data);
 
     for (name, len) in [("2/merged", 3), ("3/merged", 17 * MB)] {
         let data = random_bytes(len);
@@ -168,7 +168,7 @@ async fn s3_direct_downloads_hand_out_presigned_urls_for_merged_entries() {
     // Unmerged: proxied, and the download merges.
     let (url, _) = server.lookup("direct", &[], "v1").await.unwrap();
     assert!(url.starts_with(&server.url), "{url}");
-    assert!(server.download(&url).await.1 == data);
+    assert_eq!(server.download(&url).await.1, data);
     server.wait_for_merges().await;
 
     let db = server.state.storage.db();
@@ -199,7 +199,7 @@ async fn s3_direct_downloads_hand_out_presigned_urls_for_merged_entries() {
     assert!(url.contains("X-Amz-Signature="), "{url}");
     let response = reqwest::get(&url).await.unwrap();
     assert_eq!(response.status(), 200);
-    assert!(response.bytes().await.unwrap() == data);
+    assert_eq!(response.bytes().await.unwrap(), data);
 
     // The URL counts as a Cache Access and holds a Storage Reader Lease for
     // its lifetime, which keeps the merged object from being deleted.

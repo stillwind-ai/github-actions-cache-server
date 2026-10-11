@@ -22,6 +22,9 @@ pub struct FsStorage {
 }
 
 impl FsStorage {
+    /// # Errors
+    ///
+    /// If the storage root can't be created or resolved.
     pub async fn new(root: impl AsRef<Path>, io: FileIo) -> io::Result<Self> {
         let root = root.as_ref().to_path_buf();
         tokio::fs::create_dir_all(&root).await?;
@@ -29,10 +32,12 @@ impl FsStorage {
         Ok(Self { root, io })
     }
 
+    #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    #[must_use]
     pub fn io(&self) -> &FileIo {
         &self.io
     }
@@ -52,6 +57,12 @@ impl FsStorage {
     }
 
     /// Streams an object, failing with [`StorageError::NotFound`] up front.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::NotFound`] when the object doesn't exist,
+    /// [`StorageError::InvalidName`] for a name outside the storage root, or the
+    /// underlying I/O error.
     pub async fn read(&self, name: &str) -> Result<ByteStream, StorageError> {
         match self.io.read_file(self.path(name)?).await {
             Ok(stream) => Ok(stream),
@@ -71,6 +82,12 @@ impl FsStorage {
     ///
     /// With `expected_len`, a stream of any other length fails the write before
     /// the object becomes visible.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidName`] for a name outside the storage root, or the
+    /// underlying I/O error. A length mismatch with `expected_len` is an
+    /// [`io::ErrorKind::InvalidData`] error.
     pub async fn write<S>(
         &self,
         name: &str,
@@ -110,12 +127,21 @@ impl FsStorage {
         Ok(result?)
     }
 
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidName`] for a name outside the storage root, or the
+    /// underlying I/O error.
     pub async fn exists(&self, name: &str) -> Result<bool, StorageError> {
         Ok(self.io.file_size(self.path(name)?).await?.is_some())
     }
 
     /// Recursively deletes a folder, reporting what it contained. A missing
     /// folder is an empty deletion.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidName`] for a name outside the storage root, or the
+    /// underlying I/O error.
     pub async fn delete_folder(&self, folder: &str) -> Result<StorageDeletion, StorageError> {
         let path = self.path(folder)?;
         let folder = folder.to_owned();
@@ -143,6 +169,11 @@ impl FsStorage {
 
     /// Files directly inside a folder, names relative to it. A missing folder
     /// is empty.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidName`] for a name outside the storage root, or the
+    /// underlying I/O error.
     pub async fn list_folder(&self, folder: &str) -> Result<Vec<StorageObject>, StorageError> {
         let path = self.path(folder)?;
         Ok(blocking(move || {
@@ -168,6 +199,10 @@ impl FsStorage {
     }
 
     /// Inventory of every top-level entry under the root.
+    ///
+    /// # Errors
+    ///
+    /// If the storage root can't be listed.
     pub async fn list_storage_folders(&self) -> Result<Vec<StorageFolder>, StorageError> {
         let root = self.root.clone();
         Ok(blocking(move || {
@@ -186,6 +221,10 @@ impl FsStorage {
 
     /// Capacity and occupancy of the volume holding the root (Filesystem
     /// Capacity), including data outside the cache directory.
+    ///
+    /// # Errors
+    ///
+    /// If the filesystem statistics can't be read.
     pub async fn filesystem_usage(&self) -> Result<FilesystemUsage, StorageError> {
         let root = self.root.clone();
         Ok(blocking(move || {
@@ -218,10 +257,9 @@ fn inspect(path: &Path, folder_name: String) -> io::Result<Option<StorageFolder>
         found = true;
         if let Ok(modified) = metadata.modified()
             && let Ok(since_epoch) = modified.duration_since(UNIX_EPOCH)
-            && let Some(modified) = DateTime::<Utc>::from_timestamp(
-                since_epoch.as_secs() as i64,
-                since_epoch.subsec_nanos(),
-            )
+            && let Ok(secs) = i64::try_from(since_epoch.as_secs())
+            && let Some(modified) =
+                DateTime::<Utc>::from_timestamp(secs, since_epoch.subsec_nanos())
         {
             folder.updated_at = folder.updated_at.max(modified);
         }
@@ -314,7 +352,7 @@ mod tests {
                 }
             ]
         );
-        assert!(storage.list_folder("missing").await.unwrap().is_empty());
+        assert_eq!(storage.list_folder("missing").await.unwrap(), []);
 
         // No temp entries are left behind.
         let folders = storage.list_storage_folders().await.unwrap();

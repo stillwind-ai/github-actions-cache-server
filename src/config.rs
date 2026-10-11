@@ -17,6 +17,10 @@ pub enum StorageDriver {
 /// original TypeScript server. Only the `postgres` database driver is
 /// supported; storage is the `filesystem` or `s3` driver.
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag mirrors one environment variable"
+)]
 pub struct Config {
     /// `None` listens on all interfaces: IPv6 and IPv4 where available.
     pub listen_host: Option<IpAddr>,
@@ -34,9 +38,9 @@ pub struct Config {
 
     pub storage_driver: StorageDriver,
     pub storage_filesystem_path: PathBuf,
-    /// Use io_uring for filesystem storage I/O when the kernel allows it.
+    /// Use `io_uring` for filesystem storage I/O when the kernel allows it.
     pub storage_filesystem_io_uring: bool,
-    /// Number of io_uring worker threads, each running its own ring.
+    /// Number of `io_uring` worker threads, each running its own ring.
     pub storage_filesystem_io_uring_threads: usize,
 
     /// Delete cache entries not saved or accessed for this many days. 0 disables.
@@ -55,10 +59,21 @@ pub struct Config {
 }
 
 impl Config {
+    /// # Errors
+    ///
+    /// See [`Config::from_vars`].
     pub fn from_env() -> anyhow::Result<Self> {
         Self::from_vars(std::env::vars().collect())
     }
 
+    /// # Errors
+    ///
+    /// If a variable is malformed or out of range, an unsupported driver is
+    /// selected, or a required variable is missing.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one flat read and check per environment variable"
+    )]
     pub fn from_vars(vars: HashMap<String, String>) -> anyhow::Result<Self> {
         let env = Env(vars);
 
@@ -184,6 +199,7 @@ impl Config {
 
 impl Config {
     /// Addresses to try binding, in order.
+    #[must_use]
     pub fn listen_addrs(&self) -> Vec<SocketAddr> {
         match self.listen_host {
             Some(host) => vec![SocketAddr::new(host, self.port)],
@@ -379,7 +395,7 @@ mod tests {
         env.insert("CACHE_FILESYSTEM_MAX_USAGE_PERCENT".into(), "50".into());
         env.insert("DEBUG".into(), "yes".into());
         let config = Config::from_vars(env).unwrap();
-        assert_eq!(config.cache_filesystem_max_usage_percent, 50.0);
+        assert!((config.cache_filesystem_max_usage_percent - 50.0).abs() < f64::EPSILON);
         assert!(config.debug);
     }
 }

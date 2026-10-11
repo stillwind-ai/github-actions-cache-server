@@ -47,6 +47,7 @@ impl Task {
         Task::Merges,
     ];
 
+    #[must_use]
     pub fn name(self) -> &'static str {
         match self {
             Task::Uploads => "cleanup:uploads",
@@ -117,6 +118,7 @@ pub struct Cleanup {
 }
 
 impl Cleanup {
+    #[must_use]
     pub fn new(storage: Arc<Storage>, config: Arc<Config>) -> Self {
         Self {
             db: storage.db().clone(),
@@ -127,6 +129,10 @@ impl Cleanup {
     }
 
     /// Runs a task and logs its summary.
+    ///
+    /// # Errors
+    ///
+    /// If the task fails; the failure is also logged with its summary.
     pub async fn run(&self, task: Task) -> anyhow::Result<Summary> {
         let _running = self.running[task.index()].lock().await;
         let started = std::time::Instant::now();
@@ -147,7 +153,7 @@ impl Cleanup {
                 Task::Merges => self.merges(&mut summary).await,
             }
         };
-        summary.duration_ms = started.elapsed().as_millis() as u64;
+        summary.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         if result.is_err() && summary.failures == 0 {
             summary.failures = 1;
         }
@@ -234,6 +240,10 @@ impl Cleanup {
 
     /// Delete cache entries neither saved nor accessed within the retention
     /// period.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "float-to-int `as` saturates, and the retention period is validated to be >= 0"
+    )]
     async fn cache_entries(&self, summary: &mut Summary) -> anyhow::Result<()> {
         let cutoff = Utc::now()
             - chrono::Duration::milliseconds(
@@ -465,18 +475,18 @@ fn failures(errors: Vec<anyhow::Error>, message: &str) -> anyhow::Result<()> {
 }
 
 /// Runs each task on its schedule until `shutdown` is cancelled.
-pub fn spawn_scheduler(cleanup: Arc<Cleanup>, shutdown: CancellationToken) {
+pub fn spawn_scheduler(cleanup: &Arc<Cleanup>, shutdown: &CancellationToken) {
     for task in Task::ALL {
         let cleanup = cleanup.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
             loop {
-                let period = task.period().as_millis() as i64;
+                let period = i64::try_from(task.period().as_millis()).unwrap_or(i64::MAX);
                 let now = Utc::now().timestamp_millis();
-                let wait = Duration::from_millis((period - now.rem_euclid(period)) as u64);
+                let wait = Duration::from_millis((period - now.rem_euclid(period)).unsigned_abs());
                 tokio::select! {
-                    _ = shutdown.cancelled() => return,
-                    _ = tokio::time::sleep(wait) => {}
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(wait) => {}
                 }
                 let _ = cleanup.run(task).await;
             }

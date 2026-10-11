@@ -34,11 +34,13 @@ pub struct TokenScopes {
 
 impl TokenScopes {
     /// The scope uploads are written to.
+    #[must_use]
     pub fn write_scope(&self) -> Option<&CacheScope> {
         self.scopes.iter().find(|scope| scope.permission >= 2)
     }
 
     /// Scope names to search, highest permission first.
+    #[must_use]
     pub fn read_scopes(&self) -> Vec<String> {
         let mut scopes = self.scopes.clone();
         scopes.sort_by_key(|scope| std::cmp::Reverse(scope.permission));
@@ -68,6 +70,10 @@ pub struct Auth {
 }
 
 impl Auth {
+    /// # Panics
+    ///
+    /// If the HTTP client for fetching JWKS can't be built, i.e. the TLS
+    /// backend fails to initialize.
     pub fn new(config: &Config) -> Self {
         if config.skip_token_validation {
             tracing::warn!("Token validation is disabled. This should not be used in production!");
@@ -88,6 +94,10 @@ impl Auth {
     /// The JWKS URL can't be derived from the issuer: an enterprise with a
     /// custom issuer (`{host}/{enterpriseSlug}`) still serves its JWKS at
     /// `{host}`. Ask the OIDC discovery document instead.
+    ///
+    /// # Errors
+    ///
+    /// If the discovery document can't be fetched or has no `jwks_uri`.
     pub async fn discover_jwks_url(&self) -> anyhow::Result<String> {
         let url = format!("{}/.well-known/openid-configuration", self.issuer);
         let response = self.http.get(&url).send().await?;
@@ -195,6 +205,10 @@ impl Auth {
         Ok(data.claims)
     }
 
+    /// # Errors
+    ///
+    /// An unauthorized [`ApiError`] when the `Authorization` header is missing
+    /// or malformed, the token fails verification, or it carries no cache scopes.
     pub async fn token_scopes(&self, headers: &HeaderMap) -> Result<TokenScopes, ApiError> {
         let unauthorized = |message: &str| ApiError::new(StatusCode::UNAUTHORIZED, message);
         let token = headers

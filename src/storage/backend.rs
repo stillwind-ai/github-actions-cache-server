@@ -64,6 +64,7 @@ pub struct ComposeLimits {
 
 impl ComposeLimits {
     /// Whether Parts of these sizes, in order, can be composed.
+    #[must_use]
     pub fn allows(&self, part_sizes: &[u64]) -> bool {
         !part_sizes.is_empty()
             && part_sizes.len() <= self.max_parts
@@ -80,7 +81,10 @@ pub enum Backend {
     S3(S3Storage),
 }
 
+// The S3 arms are boxed: the AWS SDK's futures are large, and inlining them
+// here would bloat every future that awaits storage.
 impl Backend {
+    #[must_use]
     pub fn name(&self) -> &'static str {
         match self {
             Self::Filesystem(_) => "filesystem",
@@ -88,17 +92,27 @@ impl Backend {
         }
     }
 
-    /// Streams an object, failing with [`StorageError::NotFound`] up front.
+    /// Streams an object.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::NotFound`] up front for a missing object,
+    /// [`StorageError::InvalidName`], or the backend's error.
     pub async fn read(&self, name: &str) -> Result<ByteStream, StorageError> {
         match self {
             Self::Filesystem(fs) => fs.read(name).await,
-            Self::S3(s3) => s3.read(name).await,
+            Self::S3(s3) => Box::pin(s3.read(name)).await,
         }
     }
 
     /// Writes an object with atomic visibility (ADR-0004). With
     /// `expected_len`, a stream of any other length fails the write before
     /// the object becomes visible.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidName`], a stream error or length mismatch, or
+    /// the backend's error; the object is then left as it was.
     pub async fn write<S>(
         &self,
         name: &str,
@@ -110,49 +124,75 @@ impl Backend {
     {
         match self {
             Self::Filesystem(fs) => fs.write(name, stream, expected_len).await,
-            Self::S3(s3) => s3.write(name, stream, expected_len).await,
+            Self::S3(s3) => Box::pin(s3.write(name, stream, expected_len)).await,
         }
     }
 
+    /// Whether an object exists.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidName`] or the backend's error.
     pub async fn exists(&self, name: &str) -> Result<bool, StorageError> {
         match self {
             Self::Filesystem(fs) => fs.exists(name).await,
-            Self::S3(s3) => s3.exists(name).await,
+            Self::S3(s3) => Box::pin(s3.exists(name)).await,
         }
     }
 
     /// Deletes everything inside a folder, reporting what it contained. A
     /// missing folder is an empty deletion.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidName`] or the backend's error.
     pub async fn delete_folder(&self, folder: &str) -> Result<StorageDeletion, StorageError> {
         match self {
             Self::Filesystem(fs) => fs.delete_folder(folder).await,
-            Self::S3(s3) => s3.delete_folder(folder).await,
+            Self::S3(s3) => Box::pin(s3.delete_folder(folder)).await,
         }
     }
 
     /// Objects directly inside a folder, names relative to it. A missing
     /// folder is empty.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidName`] or the backend's error.
     pub async fn list_folder(&self, folder: &str) -> Result<Vec<StorageObject>, StorageError> {
         match self {
             Self::Filesystem(fs) => fs.list_folder(folder).await,
-            Self::S3(s3) => s3.list_folder(folder).await,
+            Self::S3(s3) => Box::pin(s3.list_folder(folder)).await,
         }
     }
 
+    /// Number of objects directly inside a folder.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::list_folder`].
     pub async fn count_files(&self, folder: &str) -> Result<usize, StorageError> {
         Ok(self.list_folder(folder).await?.len())
     }
 
     /// Inventory of every top-level folder the server owns.
+    ///
+    /// # Errors
+    ///
+    /// If the storage can't be listed completely.
     pub async fn list_storage_folders(&self) -> Result<Vec<StorageFolder>, StorageError> {
         match self {
             Self::Filesystem(fs) => fs.list_storage_folders().await,
-            Self::S3(s3) => s3.list_storage_folders().await,
+            Self::S3(s3) => Box::pin(s3.list_storage_folders()).await,
         }
     }
 
     /// Filesystem Capacity, for a Storage Budget relative to it. `None` for
     /// object storage, which has no capacity to speak of.
+    ///
+    /// # Errors
+    ///
+    /// If the filesystem's usage can't be read.
     pub async fn filesystem_usage(&self) -> Result<Option<FilesystemUsage>, StorageError> {
         match self {
             Self::Filesystem(fs) => fs.filesystem_usage().await.map(Some),
@@ -161,6 +201,7 @@ impl Backend {
     }
 
     /// The limits of a Server-side Merge, when the backend has one.
+    #[must_use]
     pub fn compose_limits(&self) -> Option<ComposeLimits> {
         match self {
             Self::Filesystem(_) => None,
@@ -171,23 +212,33 @@ impl Backend {
     /// Server-side Merge: copies `parts/0..n-1` of a folder into its merged
     /// object inside the backend, without passing bytes through the server.
     /// The caller checks [`Self::compose_limits`] first.
+    ///
+    /// # Errors
+    ///
+    /// On filesystem storage, or the backend's error; the merged object is
+    /// then left as it was.
     pub async fn compose_parts(&self, folder: &str, part_count: u32) -> Result<(), StorageError> {
         match self {
             Self::Filesystem(_) => Err(StorageError::Io(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "filesystem storage has no Server-side Merge",
             ))),
-            Self::S3(s3) => s3.compose_parts(folder, part_count).await,
+            Self::S3(s3) => Box::pin(s3.compose_parts(folder, part_count)).await,
         }
     }
 
     /// Whether the backend can hand out direct-download URLs.
+    #[must_use]
     pub fn supports_direct_downloads(&self) -> bool {
         matches!(self, Self::S3(_))
     }
 
     /// A URL that downloads an object directly from the backend, valid for
     /// `expires_in`. `None` when the backend has no such URLs.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidName`] or if the URL can't be signed.
     pub async fn download_url(
         &self,
         name: &str,
@@ -195,7 +246,7 @@ impl Backend {
     ) -> Result<Option<String>, StorageError> {
         match self {
             Self::Filesystem(_) => Ok(None),
-            Self::S3(s3) => s3.download_url(name, expires_in).await.map(Some),
+            Self::S3(s3) => Box::pin(s3.download_url(name, expires_in)).await.map(Some),
         }
     }
 }

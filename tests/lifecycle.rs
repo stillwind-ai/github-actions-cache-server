@@ -87,8 +87,8 @@ async fn active_downloads_are_never_evicted() {
         .save("new", "v1", &random_bytes(64 * MB), 8 * MB)
         .await;
     assert!(server.lookup("new", &[], "v1").await.is_none());
-    assert!(download.bytes().await.unwrap() == data);
-    assert!(server.restore("reading", "v1").await == data);
+    assert_eq!(download.bytes().await.unwrap(), data);
+    assert_eq!(server.restore("reading", "v1").await, data);
 }
 
 async fn hold_reader_lease(
@@ -155,7 +155,7 @@ async fn parts_are_deleted_after_the_merge_unless_a_part_reader_holds_them() {
             .unwrap(),
         0
     );
-    assert!(server.restore("parts", "v1").await == data);
+    assert_eq!(server.restore("parts", "v1").await, data);
 
     // …but it does keep the whole Storage Location from being deleted.
     cache_entry::Entity::delete_many()
@@ -181,12 +181,12 @@ async fn concurrent_first_downloads_all_get_the_payload() {
     let downloads = (0..8).map(|_| server.download(&url));
     for (status, body) in futures::future::join_all(downloads).await {
         assert_eq!(status, 200);
-        assert!(body == data);
+        assert_eq!(body, data);
     }
     server.wait_for_merges().await;
     let folder = location_of(&server, "concurrent").await.folder_name;
     let merged = server.read_object(&format!("{folder}/merged")).await;
-    assert!(merged.unwrap() == data);
+    assert_eq!(merged.unwrap(), data);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -202,7 +202,7 @@ async fn a_client_aborting_the_first_download_does_not_abort_the_merge() {
 
     server.wait_for_merges().await;
     assert!(location_of(&server, "aborted").await.merged_at.is_some());
-    assert!(server.restore("aborted", "v1").await == data);
+    assert_eq!(server.restore("aborted", "v1").await, data);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -218,8 +218,8 @@ async fn eager_merge_merges_at_upload_completion() {
     let merged = server
         .read_object(&format!("{}/merged", location.folder_name))
         .await;
-    assert!(merged.unwrap() == data);
-    assert!(server.restore("eager", "v1").await == data);
+    assert_eq!(merged.unwrap(), data);
+    assert_eq!(server.restore("eager", "v1").await, data);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -238,8 +238,8 @@ async fn eager_merge_of_large_parts_composes_them() {
     let merged = server
         .read_object(&format!("{}/merged", location.folder_name))
         .await;
-    assert!(merged.unwrap() == data);
-    assert!(server.restore("composed", "v1").await == data);
+    assert_eq!(merged.unwrap(), data);
+    assert_eq!(server.restore("composed", "v1").await, data);
 }
 
 #[tokio::test(flavor = "multi_thread")]

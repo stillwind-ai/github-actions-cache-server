@@ -34,7 +34,7 @@ use super::io::ByteStream;
 const KEY_PREFIX: &str = "gh-actions-cache";
 
 const MIB: u64 = 1024 * 1024;
-/// S3 multipart limits: https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
+/// S3 multipart limits: <https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html>
 const MIN_PART_BYTES: u64 = 5 * MIB;
 const MAX_PART_BYTES: u64 = 5 * 1024 * MIB;
 const MAX_PARTS: usize = 10_000;
@@ -151,6 +151,25 @@ fn other(message: String) -> StorageError {
     StorageError::Io(io::Error::other(message))
 }
 
+/// An object's size from a listing; S3 never reports a negative one.
+fn object_size(object: &aws_sdk_s3::types::Object) -> u64 {
+    object
+        .size
+        .and_then(|size| u64::try_from(size).ok())
+        .unwrap_or(0)
+}
+
+/// A request body's `Content-Length`. Bodies are buffered in memory, so they
+/// always fit.
+fn content_length(body: &[u8]) -> i64 {
+    i64::try_from(body.len()).expect("an in-memory body fits in i64")
+}
+
+/// S3 numbers parts from 1.
+fn part_number(index: usize) -> Result<i32, StorageError> {
+    i32::try_from(index + 1).map_err(|_| other(format!("part {index} exceeds S3's part numbers")))
+}
+
 impl S3Storage {
     pub const COMPOSE_LIMITS: ComposeLimits = ComposeLimits {
         min_part_bytes: MIN_PART_BYTES,
@@ -159,6 +178,10 @@ impl S3Storage {
     };
 
     /// Connects and checks that the bucket exists.
+    ///
+    /// # Errors
+    ///
+    /// If the bucket doesn't exist or can't be reached.
     pub async fn new(settings: &S3Settings) -> Result<Self, StorageError> {
         let client = client(settings).await;
         if let Err(err) = client.head_bucket().bucket(&settings.bucket).send().await {
@@ -175,16 +198,22 @@ impl S3Storage {
         })
     }
 
+    #[must_use]
     pub fn client(&self) -> &Client {
         &self.client
     }
 
+    #[must_use]
     pub fn bucket(&self) -> &str {
         &self.bucket
     }
 
     /// The key of an object name (`folder/parts/0`). Names are relative and
     /// slash-separated, without empty, `.` or `..` segments.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidName`] for any other name.
     pub fn key(&self, name: &str) -> Result<String, StorageError> {
         let valid = !name.is_empty()
             && name
@@ -208,8 +237,13 @@ impl S3Storage {
         )
     }
 
-    /// Streams an object, failing with [`StorageError::NotFound`] up front.
-    /// A body that stalls for longer than the socket timeout fails.
+    /// Streams an object. A body that stalls for longer than the socket
+    /// timeout fails.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::NotFound`] up front for a missing object,
+    /// [`StorageError::InvalidName`], or the request's error.
     pub async fn read(&self, name: &str) -> Result<ByteStream, StorageError> {
         let response = match self
             .client
@@ -250,6 +284,11 @@ impl S3Storage {
     /// fits in a single part, otherwise a multipart upload that is aborted on
     /// failure. With `expected_len`, a stream of any other length fails the
     /// write before the object becomes visible.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidName`], a stream error or length mismatch, or
+    /// a failed request; the object is then left as it was.
     pub async fn write<S>(
         &self,
         name: &str,
@@ -287,7 +326,8 @@ impl S3Storage {
             .map_or(WRITE_PART_BYTES, |len| {
                 len.div_ceil(MAX_PARTS as u64).next_multiple_of(MIB)
             })
-            .max(WRITE_PART_BYTES) as usize;
+            .max(WRITE_PART_BYTES);
+        let part_size = usize::try_from(part_size).unwrap_or(usize::MAX);
         let length_mismatch = |written: u64, expected: u64| {
             other(format!(
                 "wrote {written} bytes to {key}, expected {expected}"
@@ -327,7 +367,7 @@ impl S3Storage {
                     .put_object()
                     .bucket(&self.bucket)
                     .key(key)
-                    .content_length(buffer.len() as i64)
+                    .content_length(content_length(&buffer))
                     .body(S3ByteStream::from(buffer.freeze()))
                     .customize()
                     .config_override(self.transfer_config())
@@ -369,7 +409,7 @@ impl S3Storage {
         upload: &mut MultipartUpload,
         body: Bytes,
     ) -> Result<(), StorageError> {
-        let part_number = upload.parts.len() as i32 + 1;
+        let part_number = part_number(upload.parts.len())?;
         let response = self
             .client
             .upload_part()
@@ -377,7 +417,7 @@ impl S3Storage {
             .key(key)
             .upload_id(&upload.upload_id)
             .part_number(part_number)
-            .content_length(body.len() as i64)
+            .content_length(content_length(&body))
             .body(S3ByteStream::from(body))
             .customize()
             .config_override(self.transfer_config())
@@ -430,13 +470,17 @@ impl S3Storage {
 
     /// Server-side Merge (ADR-0009): `CreateMultipartUpload`, one
     /// `UploadPartCopy` per Part, `CompleteMultipartUpload`.
+    ///
+    /// # Errors
+    ///
+    /// If a request fails; the merged object is then left as it was.
     pub async fn compose_parts(&self, folder: &str, part_count: u32) -> Result<(), StorageError> {
         let key = self.key(&format!("{folder}/merged"))?;
         let mut upload = self.create_multipart_upload(&key).await?;
         let result = async {
             for index in 0..part_count {
                 let source = self.key(&format!("{folder}/parts/{index}"))?;
-                let part_number = index as i32 + 1;
+                let part_number = part_number(index as usize)?;
                 let copy = self
                     .client
                     .upload_part_copy()
@@ -469,6 +513,11 @@ impl S3Storage {
         result
     }
 
+    /// Whether an object exists.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidName`] or the request's error.
     pub async fn exists(&self, name: &str) -> Result<bool, StorageError> {
         match self
             .client
@@ -517,6 +566,10 @@ impl S3Storage {
     }
 
     /// Deletes every object inside a folder, reporting what it contained.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidName`], or if listing or deleting fails.
     pub async fn delete_folder(&self, folder: &str) -> Result<StorageDeletion, StorageError> {
         let objects = self.list(&self.folder_prefix(folder)?, false).await?;
         let mut deleted = StorageDeletion::default();
@@ -559,15 +612,16 @@ impl S3Storage {
                 )));
             }
             deleted.objects += batch.len() as u64;
-            deleted.bytes += batch
-                .iter()
-                .map(|object| object.size.unwrap_or(0).max(0) as u64)
-                .sum::<u64>();
+            deleted.bytes += batch.iter().map(object_size).sum::<u64>();
         }
         Ok(deleted)
     }
 
     /// Objects directly inside a folder, names relative to it.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidName`], or if the listing fails.
     pub async fn list_folder(&self, folder: &str) -> Result<Vec<StorageObject>, StorageError> {
         let prefix = self.folder_prefix(folder)?;
         Ok(self
@@ -575,20 +629,23 @@ impl S3Storage {
             .await?
             .into_iter()
             .filter_map(|object| {
+                let bytes = object_size(&object);
                 let name = object.key?.strip_prefix(&prefix)?.to_owned();
-                Some(StorageObject {
-                    name,
-                    bytes: object.size.unwrap_or(0).max(0) as u64,
-                })
+                Some(StorageObject { name, bytes })
             })
             .collect())
     }
 
     /// Inventory of every top-level folder under the key prefix.
+    ///
+    /// # Errors
+    ///
+    /// If the listing fails or lacks modification times.
     pub async fn list_storage_folders(&self) -> Result<Vec<StorageFolder>, StorageError> {
         let prefix = format!("{KEY_PREFIX}/");
         let mut folders = HashMap::<String, StorageFolder>::new();
         for object in self.list(&prefix, false).await? {
+            let bytes = object_size(&object);
             let Some(key) = object.key else { continue };
             let Some(folder_name) = key
                 .strip_prefix(&prefix)
@@ -614,13 +671,17 @@ impl S3Storage {
                     updated_at: DateTime::<Utc>::UNIX_EPOCH,
                 });
             folder.object_count += 1;
-            folder.bytes += object.size.unwrap_or(0).max(0) as u64;
+            folder.bytes += bytes;
             folder.updated_at = folder.updated_at.max(modified);
         }
         Ok(folders.into_values().collect())
     }
 
     /// A presigned `GetObject` URL.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidName`] or if the URL can't be signed.
     pub async fn download_url(
         &self,
         name: &str,

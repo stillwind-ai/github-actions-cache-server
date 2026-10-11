@@ -120,10 +120,21 @@ fn escape_like(value: &str) -> String {
         .replace('_', r"\_")
 }
 
+/// `percent`% of `bytes`, rounded down.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "a byte budget needs no more than f64 precision; float-to-int `as` saturates"
+)]
+fn percent_of(bytes: u64, percent: f64) -> u64 {
+    (bytes as f64 * percent / 100.0).floor() as u64
+}
+
 /// Streams the Parts of a Storage Location in order, opening each lazily.
 fn stream_parts(backend: Backend, folder_name: String, part_count: i32) -> ByteStream {
     Box::pin(async_stream::stream! {
-        for index in 0..part_count as u32 {
+        for index in 0..u32::try_from(part_count).unwrap_or(0) {
             let mut part = match backend.read(&part_name(&folder_name, index)).await {
                 Ok(part) => part,
                 Err(err) => {
@@ -143,6 +154,7 @@ fn stream_parts(backend: Backend, folder_name: String, part_count: i32) -> ByteS
 }
 
 impl Storage {
+    #[must_use]
     pub fn new(db: DatabaseConnection, backend: Backend, config: Arc<Config>) -> Self {
         Self {
             db,
@@ -152,10 +164,12 @@ impl Storage {
         }
     }
 
+    #[must_use]
     pub fn backend(&self) -> &Backend {
         &self.backend
     }
 
+    #[must_use]
     pub fn db(&self) -> &DatabaseConnection {
         &self.db
     }
@@ -169,6 +183,10 @@ impl Storage {
 
     /// Starts an Upload. `None` when an Upload for the same key is already in
     /// progress.
+    ///
+    /// # Errors
+    ///
+    /// If the database query fails.
     pub async fn create_upload(
         &self,
         key: &str,
@@ -206,6 +224,10 @@ impl Storage {
     }
 
     /// Stores one Part of an Upload. False when the Upload does not exist.
+    ///
+    /// # Errors
+    ///
+    /// If the database update or writing the Part fails.
     pub async fn upload_part<S>(&self, upload_id: i64, index: u32, body: S) -> Result<bool>
     where
         S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
@@ -259,6 +281,15 @@ impl Storage {
     /// Turns a finished Upload into a Cache Entry, replacing an existing entry
     /// for the same key. Returns the Upload's id, or `None` if there is no
     /// such Upload.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UploadRejected`] when the Upload's Parts are missing or
+    /// inconsistent, after abandoning it; otherwise database and storage errors.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one transaction-shaped sequence of checks and writes"
+    )]
     pub async fn complete_upload(
         &self,
         key: &str,
@@ -294,7 +325,7 @@ impl Storage {
             .backend
             .list_folder(&parts_folder(&upload.folder_name))
             .await?;
-        if parts.len() != upload.finished_part_upload_count as usize {
+        if usize::try_from(upload.finished_part_upload_count) != Ok(parts.len()) {
             let reason = format!(
                 "Uploaded part count does not match actual part count in storage (expected {} but found {})",
                 upload.finished_part_upload_count,
@@ -303,11 +334,11 @@ impl Storage {
             return Err(self.abandon_upload(&upload, reason).await);
         }
         // Downloads read parts 0..n-1, so anything else would be a broken entry.
-        let indices: BTreeSet<u32> = parts
+        let indices: BTreeSet<usize> = parts
             .iter()
             .filter_map(|part| part.name.parse().ok())
             .collect();
-        if !indices.iter().copied().eq(0..parts.len() as u32) {
+        if !indices.iter().copied().eq(0..parts.len()) {
             return Err(self
                 .abandon_upload(
                     &upload,
@@ -320,8 +351,8 @@ impl Storage {
         let location = storage_location::ActiveModel {
             id: Set(Uuid::new_v4()),
             folder_name: Set(upload.folder_name.clone()),
-            part_count: Set(parts.len() as i32),
-            size_bytes: Set(parts.iter().map(|part| part.bytes as i64).sum()),
+            part_count: Set(upload.finished_part_upload_count),
+            size_bytes: Set(parts.iter().map(|part| part.bytes.cast_signed()).sum()),
             created_at: Set(now),
             merge_started_at: Set(None),
             merged_at: Set(None),
@@ -404,11 +435,11 @@ impl Storage {
     ) -> Result<bool> {
         let backend = self.backend.clone();
         let folder_name = location.folder_name.clone();
-        let size = location.size_bytes as u64;
+        let size = location.size_bytes.cast_unsigned();
         if let Some(limits) = backend.compose_limits()
             && limits.allows(part_sizes)
         {
-            let part_count = location.part_count as u32;
+            let part_count = location.part_count.cast_unsigned();
             let write = async move {
                 backend.compose_parts(&folder_name, part_count).await?;
                 Ok(size)
@@ -436,6 +467,10 @@ impl Storage {
     }
 
     /// Total bytes of finalized payloads (the `cache_storage_bytes` metric).
+    ///
+    /// # Errors
+    ///
+    /// If the database query fails.
     pub async fn total_stored_bytes(&self) -> Result<u64> {
         self.stored_bytes().await
     }
@@ -445,6 +480,10 @@ impl Storage {
     /// most 90% of it. Reader leases still protect locations being read.
     /// Object storage has no capacity, so there it only applies with an
     /// explicit `CACHE_MAX_SIZE_BYTES`.
+    ///
+    /// # Errors
+    ///
+    /// If storage usage can't be read, or the database or a deletion fails.
     pub async fn enforce_storage_budget(&self) -> Result<EvictionSummary> {
         let mut summary = EvictionSummary::default();
         let filesystem_usage = match self.config.cache_max_size_bytes {
@@ -456,10 +495,10 @@ impl Storage {
         };
         let budget = match (self.config.cache_max_size_bytes, filesystem_usage) {
             (Some(max), _) => max,
-            (None, Some(usage)) => (usage.capacity_bytes as f64
-                * self.config.cache_filesystem_max_usage_percent
-                / 100.0)
-                .floor() as u64,
+            (None, Some(usage)) => percent_of(
+                usage.capacity_bytes,
+                self.config.cache_filesystem_max_usage_percent,
+            ),
             (None, None) => unreachable!("filesystem usage is read without an explicit budget"),
         };
         let target = budget / 10 * 9 + budget % 10 * 9 / 10;
@@ -518,7 +557,7 @@ impl Storage {
                     .filesystem_usage()
                     .await?
                     .map_or(usage, |current| current.used_bytes),
-                None => usage.saturating_sub(size_bytes as u64),
+                None => usage.saturating_sub(size_bytes.cast_unsigned()),
             };
         }
         Ok(summary)
@@ -528,6 +567,10 @@ impl Storage {
     /// lifetime. The first download of an unmerged entry also performs the
     /// Merge, feeding the same Part bytes to the client and the merged object.
     /// `None` when the entry doesn't exist or its data is gone.
+    ///
+    /// # Errors
+    ///
+    /// If the database or storage fails. Missing data is `Ok(None)`, not an error.
     pub async fn download(&self, cache_entry_id: Uuid) -> Result<Option<Download>> {
         // The reader's lease scope is chosen in the same locked transaction
         // that reads the merge state (ADR-0002).
@@ -563,7 +606,7 @@ impl Storage {
 
         match self.open_location(&location).await {
             Ok(Some(stream)) => Ok(Some(Download {
-                size: location.size_bytes as u64,
+                size: location.size_bytes.cast_unsigned(),
                 stream: self.protect_download(stream, lease_id),
             })),
             result => {
@@ -595,14 +638,16 @@ impl Storage {
         }
 
         let parts = parts_folder(&location.folder_name);
-        if self.backend.count_files(&parts).await? < location.part_count as usize {
+        if self.backend.count_files(&parts).await?
+            < usize::try_from(location.part_count).unwrap_or(0)
+        {
             return Err(StorageError::NotFound(parts).into());
         }
 
         let (merger_sender, merger_receiver) = mpsc::channel::<std::io::Result<Bytes>>(2);
         let backend = self.backend.clone();
         let name = merged_name(&location.folder_name);
-        let size = location.size_bytes as u64;
+        let size = location.size_bytes.cast_unsigned();
         let write = async move {
             backend
                 .write(&name, ReceiverStream::new(merger_receiver), Some(size))
@@ -669,16 +714,13 @@ impl Storage {
                 let item = if watching {
                     tokio::select! {
                         biased;
-                        lost_reason = &mut lost => match lost_reason {
-                            Ok(reason) => {
-                                yield Err(std::io::Error::other(reason));
-                                break;
-                            }
+                        lost_reason = &mut lost => if let Ok(reason) = lost_reason {
+                            yield Err(std::io::Error::other(reason));
+                            break;
+                        } else {
                             // The renewal task ended without reporting a loss.
-                            Err(_) => {
-                                watching = false;
-                                continue;
-                            }
+                            watching = false;
+                            continue;
                         },
                         item = stream.next() => item,
                     }
@@ -763,6 +805,10 @@ impl Storage {
 
     /// Finds the best Cache Entry: per scope, the exact primary key, then the
     /// newest entry prefixed by it, then each restore key exactly and by prefix.
+    ///
+    /// # Errors
+    ///
+    /// If the database or a storage existence check fails.
     pub async fn match_cache_entry(&self, query: &MatchQuery<'_>) -> Result<Option<CacheMatch>> {
         for scope in query.scopes {
             let candidates = std::iter::once((
@@ -808,6 +854,10 @@ impl Storage {
     /// can't walk a later failure back to a cache miss — so storage is
     /// validated first, and Dangling Cache Entries are purged and matching
     /// retried (ADR-0005).
+    ///
+    /// # Errors
+    ///
+    /// If the database or a storage existence check fails.
     pub async fn cache_entry_download_url(
         &self,
         query: &MatchQuery<'_>,

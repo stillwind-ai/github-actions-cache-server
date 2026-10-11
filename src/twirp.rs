@@ -93,6 +93,10 @@ pub struct GetCacheEntryDownloadUrlResponse {
     pub matched_key: String,
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's `serialize_with` passes a reference"
+)]
 fn int64_as_string<S: serde::Serializer>(value: &i64, serializer: S) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(&value.to_string())
 }
