@@ -171,6 +171,25 @@ async fn parts_are_deleted_after_the_merge_unless_a_part_reader_holds_them() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn single_part_uploads_are_merged_at_completion() {
+    let server = start().await;
+    server.save("single", "v1", b"one part", 1024).await;
+
+    let location = location_of(&server, "single").await;
+    assert_eq!(location.part_count, 1);
+    assert!(location.merged_at.is_some() && location.parts_deleted_at.is_some());
+    let folder = server.storage_path().join(&location.folder_name);
+    assert_eq!(std::fs::read(folder.join("merged")).unwrap(), b"one part");
+    assert!(!folder.join("parts/0").exists());
+
+    // The download reads the merged object and starts no Merge.
+    assert_eq!(server.restore("single", "v1").await, b"one part");
+    server.wait_for_merges().await;
+    let db = server.state.storage.db();
+    assert_eq!(merge_lease::Entity::find().count(db).await.unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn concurrent_first_downloads_all_get_the_payload() {
     let server = start().await;
     let data = random_bytes(5 * 1024 * 1024 + 17);
@@ -394,7 +413,8 @@ async fn expires_entries_after_the_retention_period() {
 #[tokio::test(flavor = "multi_thread")]
 async fn resets_stalled_merges_and_purges_expired_leases() {
     let server = start().await;
-    server.save("stalled", "v1", b"data", 1024).await;
+    // Two Parts: a single one is merged at completion.
+    server.save("stalled", "v1", b"data", 2).await;
     let location = location_of(&server, "stalled").await;
     let db = server.state.storage.db();
     let long_ago = Utc::now() - chrono::Duration::minutes(20);

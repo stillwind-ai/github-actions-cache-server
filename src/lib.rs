@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use axum::serve::ListenerExt;
 use tokio_util::sync::CancellationToken;
 
 pub use crate::config::Config;
@@ -101,6 +102,13 @@ impl App {
             cleanup::spawn_scheduler(&self.state.cleanup, &self.shutdown);
         }
 
+        // Small responses (Twirp, response heads ahead of a download body)
+        // go out at once instead of waiting on Nagle and delayed ACKs.
+        let listener = listener.tap_io(|tcp| {
+            if let Err(err) = tcp.set_nodelay(true) {
+                tracing::debug!(error = %err, "Failed to set TCP_NODELAY");
+            }
+        });
         let shutdown = self.shutdown.clone();
         axum::serve(listener, self.router())
             .with_graceful_shutdown(async move {

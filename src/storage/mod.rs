@@ -13,14 +13,13 @@ use bytes::Bytes;
 use chrono::Utc;
 use futures::{Stream, StreamExt};
 use rand::Rng;
-use sea_orm::sea_query::{Expr, Func, LikeExpr, LockType, OnConflict, Query};
+use sea_orm::sea_query::{CaseStatement, Expr, Func, LikeExpr, OnConflict, Query};
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, ExprTrait, JoinType,
-    Order, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait, TransactionTrait,
+    ActiveValue::Set, ColumnTrait, Condition, DatabaseConnection, DbErr, EntityTrait, ExprTrait,
+    JoinType, Order, QueryFilter, QueryOrder, QuerySelect, RelationTrait, TransactionTrait,
 };
 use serde::Serialize;
-use tokio::sync::{mpsc, oneshot};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::oneshot;
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
@@ -30,7 +29,6 @@ use self::leases::LEASE_RENEWAL;
 use self::lifecycle::{delete_storage_location_if_unread, no_active_reader_lease};
 use crate::config::Config;
 use crate::db::retry_on_lock_conflict;
-use crate::entity::storage_reader_lease::ReaderScope;
 use crate::entity::{cache_entry, merge_lease, storage_location, upload};
 
 /// Bounds the self-heal retry when matching keeps surfacing Dangling Cache
@@ -224,24 +222,20 @@ impl Storage {
     where
         S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
     {
-        let Some(folder_name) = upload::Entity::find_by_id(upload_id)
-            .select_only()
-            .column(upload::Column::FolderName)
-            .into_tuple::<String>()
-            .one(&self.db)
-            .await?
-        else {
-            return Ok(false);
-        };
-
-        upload::Entity::update_many()
+        // Counting the started Part also finds the Upload, in one round trip.
+        let Some(upload) = upload::Entity::update_many()
             .col_expr(
                 upload::Column::StartedPartUploadCount,
                 Expr::col(upload::Column::StartedPartUploadCount).add(1),
             )
             .filter(upload::Column::Id.eq(upload_id))
-            .exec(&self.db)
-            .await?;
+            .exec_with_returning(&self.db)
+            .await?
+            .pop()
+        else {
+            return Ok(false);
+        };
+        let folder_name = upload.folder_name;
 
         self.fs
             .write(&part_name(&folder_name, index), body, None)
@@ -260,14 +254,21 @@ impl Storage {
     }
 
     /// Database state first, then storage (ADR-0001).
-    async fn abandon_upload(&self, upload: &upload::Model, reason: String) -> Error {
-        if let Err(err) = upload::Entity::delete_by_id(upload.id).exec(&self.db).await {
-            return err.into();
+    /// Like a completion, an abandonment claims the Upload first: a
+    /// concurrent finalization may already have turned it into a Storage
+    /// Location (and renamed its only Part, so the Parts look missing), and
+    /// then its folder holds live data. `Ok(None)` when it was claimed.
+    async fn abandon_upload(&self, upload: &upload::Model, reason: String) -> Result<Option<i64>> {
+        let claimed = upload::Entity::delete_by_id(upload.id)
+            .exec(&self.db)
+            .await?;
+        if claimed.rows_affected != 1 {
+            return Ok(None);
         }
         if let Err(err) = self.fs.delete_folder(&upload.folder_name).await {
             tracing::warn!(upload = upload.id, error = %err, "Failed to delete abandoned upload");
         }
-        Error::UploadRejected(reason)
+        Err(Error::UploadRejected(reason))
     }
 
     /// Turns a finished Upload into a Cache Entry, replacing an existing entry
@@ -301,16 +302,16 @@ impl Storage {
         };
 
         if upload.finished_part_upload_count == 0 {
-            return Err(self
+            return self
                 .abandon_upload(&upload, "No parts have been uploaded".into())
-                .await);
+                .await;
         }
         if upload.started_part_upload_count != upload.finished_part_upload_count {
             let reason = format!(
                 "Not all parts have been uploaded (only {} of {} parts uploaded)",
                 upload.finished_part_upload_count, upload.started_part_upload_count
             );
-            return Err(self.abandon_upload(&upload, reason).await);
+            return self.abandon_upload(&upload, reason).await;
         }
 
         let parts = self
@@ -323,7 +324,7 @@ impl Storage {
                 upload.finished_part_upload_count,
                 parts.len()
             );
-            return Err(self.abandon_upload(&upload, reason).await);
+            return self.abandon_upload(&upload, reason).await;
         }
         // Downloads read parts 0..n-1, so anything else would be a broken entry.
         let indices: BTreeSet<usize> = parts
@@ -331,24 +332,27 @@ impl Storage {
             .filter_map(|part| part.name.parse().ok())
             .collect();
         if !indices.iter().copied().eq(0..parts.len()) {
-            return Err(self
+            return self
                 .abandon_upload(
                     &upload,
                     "Uploaded parts are not numbered contiguously from 0".into(),
                 )
-                .await);
+                .await;
         }
 
         let now = Utc::now();
+        // A single Part already is the merged object: it is renamed into
+        // place below instead of being copied by a Merge.
+        let merged = (parts.len() == 1).then_some(now);
         let location = storage_location::ActiveModel {
             id: Set(Uuid::new_v4()),
             folder_name: Set(upload.folder_name.clone()),
             part_count: Set(upload.finished_part_upload_count),
             size_bytes: Set(parts.iter().map(|part| part.bytes.cast_signed()).sum()),
             created_at: Set(now),
-            merge_started_at: Set(None),
-            merged_at: Set(None),
-            parts_deleted_at: Set(None),
+            merge_started_at: Set(merged),
+            merged_at: Set(merged),
+            parts_deleted_at: Set(merged),
             last_downloaded_at: Set(None),
         };
 
@@ -360,6 +364,17 @@ impl Storage {
         let claimed = upload::Entity::delete_by_id(upload.id).exec(&txn).await?;
         if claimed.rows_affected != 1 {
             return Ok(None);
+        }
+        // Before the commit, so the location never names a missing object
+        // (which a lookup would purge as dangling, ADR-0005). The Upload is
+        // claimed, so no one else reads or renames its Part.
+        if merged.is_some() {
+            self.fs
+                .rename(
+                    &part_name(&upload.folder_name, 0),
+                    &merged_name(&upload.folder_name),
+                )
+                .await?;
         }
         let location = storage_location::Entity::insert(location)
             .exec_with_returning(&txn)
@@ -402,20 +417,11 @@ impl Storage {
             }
         }
 
-        if self.config.eager_merge {
-            // Filesystem storage has no Server-side Merge, so an Eager Merge
-            // always streams the Parts (ADR-0009).
-            let fs = self.fs.clone();
-            let folder_name = location.folder_name.clone();
-            let size = location.size_bytes.cast_unsigned();
-            let parts = stream_parts(fs.clone(), folder_name.clone(), location.part_count);
-            let write = async move {
-                fs.write(&merged_name(&folder_name), parts, Some(size))
-                    .await
-            };
-            if let Err(err) = self.start_merge(&location, write).await {
-                tracing::warn!(error = %err, "Eager Merge failed to start after upload completion");
-            }
+        if self.config.eager_merge
+            && merged.is_none()
+            && let Err(err) = self.start_merge(&location).await
+        {
+            tracing::warn!(error = %err, "Eager Merge failed to start after upload completion");
         }
 
         Ok(Some(upload.id))
@@ -521,45 +527,19 @@ impl Storage {
     }
 
     /// Starts a proxied download, taking a Storage Reader Lease for its
-    /// lifetime. The first download of an unmerged entry also performs the
-    /// Merge, feeding the same Part bytes to the client and the merged object.
+    /// lifetime. The first download of an unmerged entry also starts the
+    /// Merge, which runs on its own while the download streams the Parts.
     /// `None` when the entry doesn't exist or its data is gone.
     ///
     /// # Errors
     ///
     /// If the database or storage fails. Missing data is `Ok(None)`, not an error.
     pub async fn download(&self, cache_entry_id: Uuid) -> Result<Option<Download>> {
-        // The reader's lease scope is chosen in the same locked transaction
-        // that reads the merge state (ADR-0002).
-        let txn = self.db.begin().await?;
-        let mut query = storage_location::Entity::find()
-            .join(
-                JoinType::InnerJoin,
-                storage_location::Relation::CacheEntry.def(),
-            )
-            .filter(cache_entry::Column::Id.eq(cache_entry_id));
-        QueryTrait::query(&mut query)
-            .lock_with_tables(LockType::Update, [storage_location::Entity]);
-        let Some(location) = query.one(&txn).await? else {
+        let Some((location, lease_id)) =
+            leases::lease_for_download(&self.db, cache_entry_id).await?
+        else {
             return Ok(None);
         };
-        let scope = if location.merged_at.is_some() {
-            ReaderScope::Storage
-        } else {
-            ReaderScope::Parts
-        };
-        let lease_id = leases::create_reader_lease(&txn, location.id, scope).await?;
-        txn.commit().await?;
-
-        // A Cache Access, for Cache Recency.
-        storage_location::Entity::update_many()
-            .col_expr(
-                storage_location::Column::LastDownloadedAt,
-                Expr::value(Utc::now()),
-            )
-            .filter(storage_location::Column::Id.eq(location.id))
-            .exec(&self.db)
-            .await?;
 
         match self.open_location(&location).await {
             Ok(Some(stream)) => Ok(Some(Download {
@@ -596,33 +576,14 @@ impl Storage {
         if self.fs.count_files(&parts).await? < usize::try_from(location.part_count).unwrap_or(0) {
             return Err(StorageError::NotFound(parts).into());
         }
-
-        let (merger_sender, merger_receiver) = mpsc::channel::<std::io::Result<Bytes>>(2);
-        let fs = self.fs.clone();
-        let name = merged_name(&location.folder_name);
-        let size = location.size_bytes.cast_unsigned();
-        let write = async move {
-            fs.write(&name, ReceiverStream::new(merger_receiver), Some(size))
-                .await
-        };
-        if !self.start_merge(location, write).await? {
-            // Someone else is merging: read the Parts, which our Part Reader
-            // Lease protects until we're done.
-            return Ok(Some(stream_parts(
-                self.fs.clone(),
-                location.folder_name.clone(),
-                location.part_count,
-            )));
-        }
-
-        let (response_sender, response_receiver) = mpsc::channel::<std::io::Result<Bytes>>(2);
-        let parts = stream_parts(
+        // Whether this download starts the Merge or another worker holds the
+        // Merge Lease, our Part Reader Lease protects the Parts we stream.
+        self.start_merge(location).await?;
+        Ok(Some(stream_parts(
             self.fs.clone(),
             location.folder_name.clone(),
             location.part_count,
-        );
-        tokio::spawn(pump_parts(parts, response_sender, merger_sender));
-        Ok(Some(Box::pin(ReceiverStream::new(response_receiver))))
+        )))
     }
 
     /// Ties a Storage Reader Lease to a download stream: renewed while the
@@ -687,15 +648,12 @@ impl Storage {
         })
     }
 
-    /// Runs a Merge under a Merge Lease. `write` produces the merged object;
-    /// a lease-fenced transaction then marks the Merge complete. Returns false
-    /// when another worker holds the lease. Writing straight to the final
-    /// object is safe because Parts are immutable (ADR-0004). The background
-    /// task never fails: errors are logged and the merge state rolled back.
-    async fn start_merge<W>(&self, location: &storage_location::Model, write: W) -> Result<bool>
-    where
-        W: Future<Output = Result<u64, StorageError>> + Send + 'static,
-    {
+    /// Runs a Merge under a Merge Lease in the background: the Parts are
+    /// concatenated into the merged object inside the kernel, then a
+    /// lease-fenced transaction marks the Merge complete. Returns false when
+    /// another worker holds the lease. The background task never fails:
+    /// errors are logged and the merge state rolled back.
+    async fn start_merge(&self, location: &storage_location::Model) -> Result<bool> {
         let location_id = location.id;
         let Some(token) = leases::acquire_merge_lease(&self.db, location_id).await? else {
             return Ok(false);
@@ -709,6 +667,12 @@ impl Storage {
             .exec(&self.db)
             .await?;
 
+        let fs = self.fs.clone();
+        let parts: Vec<String> = (0..location.part_count.cast_unsigned())
+            .map(|index| part_name(&location.folder_name, index))
+            .collect();
+        let merged = merged_name(&location.folder_name);
+        let size = location.size_bytes.cast_unsigned();
         let db = self.db.clone();
         self.merges.spawn(async move {
             let renewal = {
@@ -729,7 +693,9 @@ impl Storage {
             };
 
             let result = async {
-                write.await?;
+                // Parts are immutable (ADR-0004) and the merged object only
+                // becomes visible once its length is verified.
+                fs.concat(&parts, &merged, size).await?;
                 // The merged object is already written, so losing a deadlock
                 // here must not throw the merge away; the fence is re-checked
                 // on every attempt.
@@ -756,49 +722,83 @@ impl Storage {
     }
 
     /// Finds the best Cache Entry: per scope, the exact primary key, then the
-    /// newest entry prefixed by it, then each restore key exactly and by prefix.
+    /// newest entry prefixed by it, then each restore key exactly and by
+    /// prefix.
     ///
     /// # Errors
     ///
-    /// If the database or a storage existence check fails.
+    /// If the database fails.
     pub async fn match_cache_entry(&self, query: &MatchQuery<'_>) -> Result<Option<CacheMatch>> {
-        for scope in query.scopes {
-            let candidates = std::iter::once((
-                query.primary_key,
-                MatchType::ExactPrimary,
-                MatchType::PrefixedPrimary,
-            ))
-            .chain(query.restore_keys.iter().map(|key| {
-                (
-                    key.as_str(),
-                    MatchType::ExactRestore,
-                    MatchType::PrefixedRestore,
-                )
-            }));
-            for (key, exact, prefixed) in candidates {
-                for (match_type, condition) in [
-                    (exact, cache_entry::Column::Key.eq(key)),
-                    (
-                        prefixed,
-                        Expr::col((cache_entry::Entity, cache_entry::Column::Key))
-                            .like(LikeExpr::new(format!("{}%", escape_like(key))).escape('\\')),
-                    ),
-                ] {
-                    let entry = cache_entry::Entity::find()
-                        .filter(cache_entry::Column::RepoId.eq(query.repo_id))
-                        .filter(cache_entry::Column::Scope.eq(scope))
-                        .filter(cache_entry::Column::Version.eq(query.version))
-                        .filter(condition)
-                        .order_by_desc(cache_entry::Column::UpdatedAt)
-                        .one(&self.db)
-                        .await?;
-                    if let Some(entry) = entry {
-                        return Ok(Some(CacheMatch { entry, match_type }));
-                    }
+        Ok(self.find_match(query).await?.map(|(found, _)| found))
+    }
+
+    /// [`Self::match_cache_entry`] in one query, with the entry's Storage
+    /// Location. Every candidate is ranked by the first (scope, key, exact or
+    /// prefix) level it satisfies, so the lowest rank, newest first, is the
+    /// entry that checking the levels one by one would find, without a round
+    /// trip per level.
+    async fn find_match(
+        &self,
+        query: &MatchQuery<'_>,
+    ) -> Result<Option<(CacheMatch, Option<storage_location::Model>)>> {
+        let keys: Vec<&str> = std::iter::once(query.primary_key)
+            .chain(query.restore_keys.iter().map(String::as_str))
+            .collect();
+        let scope = || Expr::col((cache_entry::Entity, cache_entry::Column::Scope));
+        let key = || Expr::col((cache_entry::Entity, cache_entry::Column::Key));
+        let prefixed = |prefix: &str| {
+            key().like(LikeExpr::new(format!("{}%", escape_like(prefix))).escape('\\'))
+        };
+        let mut rank = CaseStatement::new();
+        let mut level = 0;
+        for scope_name in query.scopes {
+            for candidate in &keys {
+                for condition in [key().eq(*candidate), prefixed(candidate)] {
+                    rank = rank.case(
+                        Condition::all()
+                            .add(scope().eq(scope_name.as_str()))
+                            .add(condition),
+                        Expr::val(level),
+                    );
+                    level += 1;
                 }
             }
         }
-        Ok(None)
+        let Some((entry, location)) = cache_entry::Entity::find()
+            .find_also_related(storage_location::Entity)
+            .filter(cache_entry::Column::RepoId.eq(query.repo_id))
+            .filter(cache_entry::Column::Version.eq(query.version))
+            .filter(cache_entry::Column::Scope.is_in(query.scopes))
+            .filter(keys.iter().fold(Condition::any(), |any, candidate| {
+                any.add(prefixed(candidate))
+            }))
+            .order_by(
+                Into::<Expr>::into(rank.finally(Expr::val(level))),
+                Order::Asc,
+            )
+            .order_by_desc(cache_entry::Column::UpdatedAt)
+            .one(&self.db)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let match_type = keys
+            .iter()
+            .enumerate()
+            .find_map(|(index, candidate)| {
+                let (exact, prefixed) = if index == 0 {
+                    (MatchType::ExactPrimary, MatchType::PrefixedPrimary)
+                } else {
+                    (MatchType::ExactRestore, MatchType::PrefixedRestore)
+                };
+                if entry.key == *candidate {
+                    Some(exact)
+                } else {
+                    entry.key.starts_with(candidate).then_some(prefixed)
+                }
+            })
+            .expect("the query only returns entries matching a key");
+        Ok(Some((CacheMatch { entry, match_type }, location)))
     }
 
     /// Matches a Cache Entry and returns its download URL. Returning a URL is
@@ -815,12 +815,9 @@ impl Storage {
         query: &MatchQuery<'_>,
     ) -> Result<Option<(String, cache_entry::Model)>> {
         for _ in 0..MAX_DANGLING_PURGE_ATTEMPTS {
-            let Some(CacheMatch { entry, .. }) = self.match_cache_entry(query).await? else {
+            let Some((CacheMatch { entry, .. }, location)) = self.find_match(query).await? else {
                 return Ok(None);
             };
-            let location = storage_location::Entity::find_by_id(entry.location_id)
-                .one(&self.db)
-                .await?;
             let valid = match &location {
                 Some(location) => self.storage_has_data(location).await?,
                 None => false,
@@ -920,61 +917,6 @@ async fn rollback_merge(
         .exec(db)
         .await?;
     Ok(())
-}
-
-/// Feeds Part bytes to both the client and the merger, each with
-/// backpressure. A client that goes away doesn't stop the merge; a merger
-/// failure doesn't stop the client. A read error is passed to both, so the
-/// merger never mistakes a truncated stream for a complete one (it also checks
-/// the byte count).
-async fn pump_parts(
-    mut parts: ByteStream,
-    response: mpsc::Sender<std::io::Result<Bytes>>,
-    merger: mpsc::Sender<std::io::Result<Bytes>>,
-) {
-    let mut response = Some(response);
-    let mut merger = Some(merger);
-    while let Some(chunk) = parts.next().await {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(err) => {
-                let message = err.to_string();
-                if let Some(response) = &response {
-                    let _ = response
-                        .send(Err(std::io::Error::new(err.kind(), message.clone())))
-                        .await;
-                }
-                if let Some(merger) = &merger {
-                    let _ = merger
-                        .send(Err(std::io::Error::new(err.kind(), message)))
-                        .await;
-                }
-                return;
-            }
-        };
-        let to_response = async {
-            match &response {
-                Some(sender) => sender.send(Ok(chunk.clone())).await.is_ok(),
-                None => false,
-            }
-        };
-        let to_merger = async {
-            match &merger {
-                Some(sender) => sender.send(Ok(chunk.clone())).await.is_ok(),
-                None => false,
-            }
-        };
-        let (response_open, merger_open) = tokio::join!(to_response, to_merger);
-        if !response_open {
-            response = None;
-        }
-        if !merger_open {
-            merger = None;
-        }
-        if response.is_none() && merger.is_none() {
-            return;
-        }
-    }
 }
 
 /// Stops renewing and releases a Storage Reader Lease when its download stream
