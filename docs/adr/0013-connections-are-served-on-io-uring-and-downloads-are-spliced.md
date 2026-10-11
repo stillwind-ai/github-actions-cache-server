@@ -14,6 +14,20 @@ The server implements what the cache clients and the passthrough need: keep-aliv
 
 Where io_uring is unavailable (`IO_URING=false`, a build without the `io-uring` feature, or a kernel or seccomp profile that refuses a ring at startup, as Docker's default profile does), connections are served by `axum::serve` on hyper and file I/O blocks on tokio's pool, exactly as before. The `STORAGE_FILESYSTEM_IO_URING` and `STORAGE_FILESYSTEM_IO_URING_THREADS` variables still work as aliases for `IO_URING` and `IO_URING_THREADS`. CI runs the whole suite both ways.
 
-Results on the `cargo bench` workloads, interleaved runs against the previous server (medians of three rounds on a 4-CPU VM): BENCH_RESULTS
+Results on the `cargo bench` workloads, from runs interleaved with the previous server (medians of three rounds on a 4-CPU VM):
+
+| Scenario | Wall time | Server CPU |
+|---|---|---|
+| `actions-cache/restore` | 3.55 s → 2.71 s (−24%) | 9.38 s → 4.22 s (−55%) |
+| `actions-cache/save` | 1.67 s → 1.71 s (+2%) | 2.38 s → 2.10 s (−12%) |
+| `actions-cache/lookup-misses` | 1.27 s → 1.17 s (−8%) | 2.15 s → 1.54 s (−28%) |
+| `buildkit/cold` | 16.41 s → 14.35 s (−13%) | 14.09 s → 11.69 s (−17%) |
+| `buildkit/warm` | 0.46 s → 0.39 s (−15%) | 0.62 s → 0.36 s (−42%) |
+| `buildkit/change` | 3.40 s → 2.66 s (−22%) | 3.47 s → 2.37 s (−32%) |
+| `sccache/cold` | 6.27 s → 6.19 s (−1%) | 8.81 s → 7.98 s (−9%) |
+| `sccache/warm` | 2.60 s → 2.46 s (−5%) | 3.24 s → 2.03 s (−37%) |
+| `fleet` | 24.07 s → 23.07 s (−4%) | 69.66 s → 56.17 s (−19%) |
+
+Server CPU falls everywhere and most for downloads. Wall time is noisy on a shared VM: single runs vary by tens of percent, so it is the CPU numbers that are reliable. Peak RSS falls in every scenario but `actions-cache/save`, where uploads receive in 1 MiB frames and it rose from about 80–110 MiB to about 140–150 MiB. Per-request latency under the mixed `fleet` load is mixed: lookups and exports are faster, while restores and saves are somewhat slower at the median, because a connection stays on the ring thread that accepted it rather than being work-stolen.
 
 With downloads no longer copying, a profile of `actions-cache/restore` shows the largest remaining server cost is the Merge's `copy_file_range`. On a filesystem without reflinks (ext4) that copy is a full memcpy of every multi-Part archive, while downloads now splice Parts as cheaply as a merged object. Whether the filesystem driver should keep merging is left for a separate decision.
