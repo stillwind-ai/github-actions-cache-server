@@ -38,7 +38,7 @@ const READ_BUFFER: usize = 16 * 1024;
 /// Body frames are received into buffers of this size, filled completely.
 const BODY_CHUNK: usize = CHUNK_SIZE;
 /// Frames buffered between the socket and the handler.
-const BODY_FRAMES_IN_FLIGHT: usize = 2;
+const BODY_FRAMES_IN_FLIGHT: usize = 1;
 /// Response frames gathered into one `sendmsg` when they are ready together.
 const MAX_GATHER: usize = 64;
 /// Pipes kept per ring thread for splicing downloads.
