@@ -8,6 +8,25 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: postgres
 
+  # S3-compatible storage for STORAGE_DRIVER=s3 (and the S3 test suite:
+  # TEST_STORAGE_DRIVER=s3 cargo test).
+  rustfs:
+    image: rustfs/rustfs:1.0.0-glibc
+    ports:
+      - 9000:9000
+      - 9001:9001
+    environment:
+      RUSTFS_ACCESS_KEY: access_key
+      RUSTFS_SECRET_KEY: secret_key
+      RUSTFS_CONSOLE_ENABLE: 'true'
+    post_start:
+      - command:
+          - sh
+          - -ec
+          - |
+            set -- curl --fail --silent --show-error --aws-sigv4 aws:amz:us-east-1:s3 --user "$$RUSTFS_ACCESS_KEY:$$RUSTFS_SECRET_KEY"
+            "$$@" --head http://localhost:9000/test || "$$@" --retry 30 --retry-delay 1 --retry-all-errors --request PUT http://localhost:9000/test
+
   # cache-server:
   #   build:
   #     dockerfile: Dockerfile
@@ -24,6 +43,12 @@ services:
   #     API_BASE_URL: http://localhost:3000
   #     STORAGE_FILESYSTEM_PATH: /data/cache
   #     DB_POSTGRES_URL: postgres://postgres:postgres@postgres:5432/postgres
+  #     # Or store cache data in the RustFS bucket above:
+  #     # STORAGE_DRIVER: s3
+  #     # STORAGE_S3_BUCKET: test
+  #     # AWS_ACCESS_KEY_ID: access_key
+  #     # AWS_SECRET_ACCESS_KEY: secret_key
+  #     # AWS_ENDPOINT_URL: http://rustfs:9000
   #   volumes:
   #     - cache-data:/data
 

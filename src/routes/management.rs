@@ -380,7 +380,7 @@ async fn delete_storage_location(
     if let Err(err) = storage_location::Entity::delete_by_id(id).exec(db).await {
         return internal(err);
     }
-    if let Err(err) = state.storage.fs().delete_folder(&folder).await {
+    if let Err(err) = state.storage.backend().delete_folder(&folder).await {
         return internal(err);
     }
     StatusCode::OK.into_response()

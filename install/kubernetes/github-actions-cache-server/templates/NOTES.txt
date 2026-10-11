@@ -2,7 +2,11 @@ GitHub Actions Cache Server has been deployed!
 
   Release:   {{ .Release.Name }}
   Namespace: {{ .Release.Namespace }}
+{{- if eq .Values.config.storage.driver "s3" }}
+  Storage:   s3 (bucket {{ .Values.config.storage.s3.bucket }})
+{{- else }}
   Storage:   filesystem ({{ .Values.config.storage.filesystem.path }})
+{{- end }}
   Database:  postgres
 
 {{- if .Values.config.apiBaseUrl }}

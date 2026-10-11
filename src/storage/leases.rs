@@ -141,6 +141,54 @@ pub async fn lease_for_download(
         .map(|location| (location, lease_id)))
 }
 
+/// Starts a direct download of a merged Storage Location, in one statement
+/// like [`lease_for_download`]: locks the location if it is (still) merged,
+/// takes a Storage Reader Lease on its merged object that expires at
+/// `expires_at` and is never renewed, as the server can't observe when the
+/// download ends, and records the Cache Access. `None` when the location is
+/// gone or not merged.
+///
+/// # Errors
+///
+/// If the database fails.
+pub async fn lease_for_direct_download(
+    db: &impl ConnectionTrait,
+    storage_location_id: Uuid,
+    expires_at: DateTime<Utc>,
+) -> Result<Option<storage_location::Model>, DbErr> {
+    let statement = Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r"
+        WITH location AS (
+            SELECT *
+            FROM storage_locations
+            WHERE id = $1 AND merged_at IS NOT NULL
+            FOR UPDATE
+        ), lease AS (
+            INSERT INTO storage_reader_leases (id, storage_location_id, scope, expires_at)
+            -- ReaderScope::Storage.
+            SELECT $2, id, 'storage', $3
+            FROM location
+        ), access AS (
+            UPDATE storage_locations SET last_downloaded_at = $4
+            FROM location
+            WHERE storage_locations.id = location.id
+        )
+        SELECT * FROM location
+        ",
+        [
+            storage_location_id.into(),
+            Uuid::new_v4().into(),
+            expires_at.into(),
+            Utc::now().into(),
+        ],
+    );
+    storage_location::Entity::find()
+        .from_raw_sql(statement)
+        .one(db)
+        .await
+}
+
 /// # Errors
 ///
 /// If the database query fails.

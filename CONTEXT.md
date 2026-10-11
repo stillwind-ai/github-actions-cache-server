@@ -8,7 +8,7 @@ This context describes the cache data managed by the server throughout its lifec
 A cache item available for matching and restoration by a workflow.
 
 **Storage Budget**:
-The maximum amount of cache-server-managed, finalized cache payloads that may occupy storage before capacity-based eviction reclaims space. An explicit byte-based maximum may define it; otherwise it is a configurable percentage of the filesystem capacity, defaulting to 90%.
+The maximum amount of cache-server-managed, finalized cache payloads that may occupy storage before capacity-based eviction reclaims space. An explicit byte-based maximum may define it; otherwise, on filesystem storage, it is a configurable percentage of the filesystem capacity, defaulting to 90%. Object storage without an explicit maximum has no Storage Budget.
 _Avoid_: Storage limit, disk limit
 
 **Filesystem Capacity**:

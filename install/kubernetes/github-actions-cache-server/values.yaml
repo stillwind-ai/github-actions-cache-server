@@ -22,6 +22,11 @@ config:
   # If empty, defaults to the internal Kubernetes service URL.
   apiBaseUrl: ''
 
+  # -- Send runners a presigned URL to download merged cache entries straight
+  # from the S3 bucket instead of proxying them through the server.
+  # The runners must be able to reach the S3 endpoint. Ignored on filesystem storage.
+  enableDirectDownloads: false
+
   # -- Merge cache parts right after upload instead of on first download.
   # Doubles storage per entry until the parts cleanup job runs.
   eagerMerge: false
@@ -30,7 +35,8 @@ config:
   cacheCleanupOlderThanDays: 90
 
   # -- Maximum bytes occupied by finalized cache payloads. Leave unset to use
-  # the filesystem percentage below.
+  # the filesystem percentage below. With S3 storage, Capacity-based Eviction
+  # only happens when this is set.
   # cacheMaxSizeBytes: 107374182400
 
   # -- Maximum filesystem volume usage before Capacity-based Eviction starts.
@@ -56,11 +62,35 @@ config:
   # regular file I/O on its own.
   ioUring: true
 
-  # -- Filesystem storage. Cache files live on the persistent volume.
+  # -- Cache storage.
   storage:
+    # -- Storage driver to use: "filesystem" or "s3"
+    driver: filesystem
+
+    # -- Filesystem storage. Cache files live on the persistent volume.
     filesystem:
       # -- Path to store cache files
       path: /data/cache
+
+    # -- S3 (or S3-compatible, e.g. MinIO, RustFS, Ceph, R2) storage. Objects
+    # are stored under the `gh-actions-cache/` prefix of the bucket.
+    # Without access keys, the AWS default credential chain applies (e.g. IRSA).
+    s3:
+      # -- S3 bucket name (required when driver is "s3"). It must already exist.
+      # bucket: ''
+      # -- AWS region (defaults to "us-east-1")
+      # region: us-east-1
+      # -- Custom S3 endpoint URL (e.g. for MinIO: "http://minio:9000")
+      # endpointUrl: ''
+      # -- AWS access key ID. Can also be provided via existingSecret.
+      # accessKeyId: ''
+      # -- AWS secret access key. Can also be provided via existingSecret.
+      # secretAccessKey: ''
+      # -- Address buckets by path (`endpoint/bucket/key`) rather than by
+      # virtual host (`bucket.endpoint/key`).
+      forcePathStyle: true
+      # -- Response and download inactivity timeout in milliseconds.
+      socketTimeoutMs: 10000
 
   # -- PostgreSQL database (required).
   # Use either `url` OR individual connection settings (host, port, etc.), or
@@ -84,7 +114,8 @@ config:
 
 # -- Name of an existing Kubernetes Secret containing sensitive environment variables.
 # Use this to avoid storing secrets in values.yaml. The secret keys should match
-# the env var names (e.g., DB_POSTGRES_PASSWORD, DB_POSTGRES_URL, MANAGEMENT_API_KEY)
+# the env var names (e.g., DB_POSTGRES_PASSWORD, DB_POSTGRES_URL, MANAGEMENT_API_KEY,
+# AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
 existingSecret: ''
 
 serviceAccount:

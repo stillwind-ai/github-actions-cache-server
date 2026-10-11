@@ -54,6 +54,13 @@ jobs:
             postgres: postgres:17
             io-uring: false
             run: cargo test --locked
+          # The whole suite again on S3 storage, one bucket per test.
+          - name: Test (S3)
+            cache-key: test
+            postgres: postgres:17
+            rustfs: rustfs/rustfs:1.0.0-glibc
+            storage-driver: s3
+            run: cargo test --locked
     services:
       postgres:
         # An empty image skips the service for entries that don't need it.
@@ -64,9 +71,22 @@ jobs:
           - 5432:5432
         options: >-
           --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+      rustfs:
+        image: ${{ matrix.rustfs || '' }}
+        env:
+          RUSTFS_ACCESS_KEY: access_key
+          RUSTFS_SECRET_KEY: secret_key
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "curl -fsS http://localhost:9000/health" --health-interval 2s --health-timeout 5s --health-retries 30
     env:
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       STORAGE_FILESYSTEM_IO_URING: ${{ matrix.io-uring }}
+      TEST_STORAGE_DRIVER: ${{ matrix.storage-driver }}
+      TEST_S3_ENDPOINT: http://localhost:9000
+      TEST_S3_ACCESS_KEY_ID: access_key
+      TEST_S3_SECRET_ACCESS_KEY: secret_key
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -166,8 +186,10 @@ jobs:
       - run: |
           helm template ci "$CHART_DIR" --set config.db.postgres.url=postgres://cache@db/cache > /dev/null
           helm template ci "$CHART_DIR" --set config.db.postgres.host=db --set replicaCount=3 > /dev/null
-          # A release without a database must be rejected.
+          helm template ci "$CHART_DIR" --set config.db.postgres.url=postgres://cache@db/cache --set config.storage.driver=s3 --set config.storage.s3.bucket=cache > /dev/null
+          # A release without a database, or on S3 without a bucket, must be rejected.
           ! helm template ci "$CHART_DIR" > /dev/null 2>&1
+          ! helm template ci "$CHART_DIR" --set config.db.postgres.url=postgres://cache@db/cache --set config.storage.driver=s3 > /dev/null 2>&1
       - run: helm package "$CHART_DIR" --destination packaged
 
   deploy:

@@ -77,7 +77,7 @@ Otherwise enabled: cache files live on the volume.
 {{- if kindIs "bool" .Values.persistentVolumeClaim.enabled -}}
   {{- .Values.persistentVolumeClaim.enabled -}}
 {{- else -}}
-  true
+  {{- eq .Values.config.storage.driver "filesystem" -}}
 {{- end -}}
 {{- end }}
 
@@ -109,6 +109,12 @@ to prevent errors when multiple pods attach to the same volume.
 Validate configuration. Fails if incompatible settings are detected.
 */}}
 {{- define "github-actions-cache-server.validate" -}}
+{{- if not (has .Values.config.storage.driver (list "filesystem" "s3")) -}}
+{{- fail (printf "config.storage.driver must be \"filesystem\" or \"s3\", not %q." .Values.config.storage.driver) -}}
+{{- end -}}
+{{- if and (eq .Values.config.storage.driver "s3") (not (or .Values.config.storage.s3.bucket .Values.existingSecret .Values.extraEnvFrom .Values.extraEnv)) -}}
+{{- fail "S3 storage needs a bucket: set config.storage.s3.bucket (or provide STORAGE_S3_BUCKET via existingSecret)." -}}
+{{- end -}}
 {{- with .Values.config.db.postgres }}
 {{- if not (or .url .host $.Values.existingSecret $.Values.extraEnvFrom $.Values.extraEnv) -}}
 {{- fail "A PostgreSQL database is required: set config.db.postgres.url or config.db.postgres.host (or provide DB_POSTGRES_URL via existingSecret)." -}}
@@ -124,6 +130,8 @@ Generate environment variables from config values.
   value: "3000"
 - name: API_BASE_URL
   value: {{ default (printf "http://%s.%s.svc.cluster.local:%v" (include "github-actions-cache-server.fullname" .) .Release.Namespace .Values.service.port) .Values.config.apiBaseUrl | quote }}
+- name: ENABLE_DIRECT_DOWNLOADS
+  value: {{ .Values.config.enableDirectDownloads | quote }}
 - name: EAGER_MERGE
   value: {{ .Values.config.eagerMerge | quote }}
 - name: CACHE_CLEANUP_OLDER_THAN_DAYS
@@ -148,10 +156,46 @@ Generate environment variables from config values.
 - name: MANAGEMENT_API_KEY
   value: {{ .Values.config.managementApiKey | quote }}
 {{- end }}
+{{/* Storage driver */}}
+- name: STORAGE_DRIVER
+  value: {{ .Values.config.storage.driver | quote }}
+{{- if eq .Values.config.storage.driver "filesystem" }}
 - name: STORAGE_FILESYSTEM_PATH
   value: {{ .Values.config.storage.filesystem.path | quote }}
 - name: STORAGE_FILESYSTEM_IO_URING
   value: {{ .Values.config.ioUring | quote }}
+{{- else if eq .Values.config.storage.driver "s3" }}
+{{- with .Values.config.storage.s3 }}
+{{- if .bucket }}
+- name: STORAGE_S3_BUCKET
+  value: {{ .bucket | quote }}
+{{- end }}
+{{- if .region }}
+- name: AWS_REGION
+  value: {{ .region | quote }}
+{{- end }}
+{{- if .endpointUrl }}
+- name: AWS_ENDPOINT_URL
+  value: {{ .endpointUrl | quote }}
+{{- end }}
+{{- if .accessKeyId }}
+- name: AWS_ACCESS_KEY_ID
+  value: {{ .accessKeyId | quote }}
+{{- end }}
+{{- if .secretAccessKey }}
+- name: AWS_SECRET_ACCESS_KEY
+  value: {{ .secretAccessKey | quote }}
+{{- end }}
+{{- if kindIs "bool" .forcePathStyle }}
+- name: STORAGE_S3_FORCE_PATH_STYLE
+  value: {{ .forcePathStyle | quote }}
+{{- end }}
+{{- if .socketTimeoutMs }}
+- name: STORAGE_S3_SOCKET_TIMEOUT_MS
+  value: {{ .socketTimeoutMs | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{/* Database */}}
 {{- with .Values.config.db.postgres }}
 {{- if .maxConnections }}
