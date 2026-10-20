@@ -176,7 +176,7 @@ impl FileIo {
     }
 
     /// Streams the `size` bytes of an open file.
-    #[must_use]
+    #[must_use = "the stream reads nothing until polled"]
     pub fn read_open(&self, file: Arc<std::fs::File>, size: u64) -> ByteStream {
         match self {
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -186,7 +186,7 @@ impl FileIo {
     }
 
     /// Streams the files of `body` one after another.
-    #[must_use]
+    #[must_use = "the stream reads nothing until polled"]
     pub fn read_segments(&self, body: &FileBody) -> ByteStream {
         let io = self.clone();
         let segments = body.segments().to_vec();

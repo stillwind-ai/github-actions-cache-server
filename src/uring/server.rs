@@ -1118,6 +1118,6 @@ mod tests {
             .unwrap();
         let (body, rest) = idle.await.unwrap();
         assert_eq!(body, b"x");
-        assert!(rest.is_empty());
+        assert_eq!(rest, [] as [u8; 0]);
     }
 }
