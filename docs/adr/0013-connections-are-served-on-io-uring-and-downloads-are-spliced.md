@@ -18,16 +18,16 @@ Results on the `cargo bench` workloads, from runs interleaved with the previous 
 
 | Scenario | Wall time | Server CPU |
 |---|---|---|
-| `actions-cache/restore` | 3.55 s → 2.71 s (−24%) | 9.38 s → 4.22 s (−55%) |
-| `actions-cache/save` | 1.67 s → 1.71 s (+2%) | 2.38 s → 2.10 s (−12%) |
-| `actions-cache/lookup-misses` | 1.27 s → 1.17 s (−8%) | 2.15 s → 1.54 s (−28%) |
-| `buildkit/cold` | 16.41 s → 14.35 s (−13%) | 14.09 s → 11.69 s (−17%) |
-| `buildkit/warm` | 0.46 s → 0.39 s (−15%) | 0.62 s → 0.36 s (−42%) |
-| `buildkit/change` | 3.40 s → 2.66 s (−22%) | 3.47 s → 2.37 s (−32%) |
-| `sccache/cold` | 6.27 s → 6.19 s (−1%) | 8.81 s → 7.98 s (−9%) |
-| `sccache/warm` | 2.60 s → 2.46 s (−5%) | 3.24 s → 2.03 s (−37%) |
-| `fleet` | 24.07 s → 23.07 s (−4%) | 69.66 s → 56.17 s (−19%) |
+| `actions-cache/restore` | 1.74 s → 1.45 s (−17%) | 4.21 s → 1.73 s (−59%) |
+| `actions-cache/save` | 1.09 s → 0.84 s (−23%) | 1.35 s → 1.14 s (−16%) |
+| `actions-cache/lookup-misses` | 0.74 s → 0.76 s (+3%) | 1.28 s → 0.99 s (−23%) |
+| `buildkit/cold` | 8.77 s → 8.35 s (−5%) | 6.89 s → 6.30 s (−9%) |
+| `buildkit/warm` | 0.63 s → 2.56 s, see below | 0.37 s → 0.25 s (−32%) |
+| `buildkit/change` | 1.92 s → 1.99 s (+4%) | 2.17 s → 1.55 s (−29%) |
+| `sccache/cold` | 4.02 s → 3.95 s (−2%) | 5.03 s → 4.67 s (−7%) |
+| `sccache/warm` | 1.79 s → 1.86 s (+4%) | 2.02 s → 1.43 s (−29%) |
+| `fleet` | 10.98 s → 10.62 s (−3%) | 26.75 s → 21.64 s (−19%) |
 
-Server CPU falls everywhere and most for downloads. Wall time is noisy on a shared VM: single runs vary by tens of percent, so it is the CPU numbers that are reliable. Peak RSS falls in every scenario but `actions-cache/save`, where uploads receive in 1 MiB frames and it rose from about 80–110 MiB to about 140–150 MiB. Per-request latency under the mixed `fleet` load is mixed: lookups and exports are faster, while restores and saves are somewhat slower at the median, because a connection stays on the ring thread that accepted it rather than being work-stolen.
+Server CPU falls in every scenario, most for downloads. Wall time falls clearly where transfers dominate (restore and save) and is within ±5% elsewhere. Wall time is noisy on a shared VM: single runs vary by tens of percent, so it is the CPU numbers that are reliable. `buildkit/warm` is slower only because the previous server answered an in-progress index upload with `{"ok":false}`, which made BuildKit fail the export at once. The compared build answers Twirp `already_exists`, as fixed separately, and BuildKit waits 2 s and retries, so its exports succeed. Peak RSS falls in every scenario but `actions-cache/save`, where uploads receive in 1 MiB frames and it rose from 123 MiB to 132 MiB. Under the mixed `fleet` load, lookups, downloads and exports are faster at the median. Restores (+16%) and saves (+13%) are slower, because a connection stays on the ring thread that accepted it rather than being work-stolen.
 
 With downloads no longer copying, a profile of `actions-cache/restore` shows the largest remaining server cost is the Merge's `copy_file_range`. On a filesystem without reflinks (ext4) that copy is a full memcpy of every multi-Part archive, while downloads now splice Parts as cheaply as a merged object. Whether the filesystem driver should keep merging is left for a separate decision.
