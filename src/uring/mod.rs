@@ -80,42 +80,30 @@ pub struct Ring {
     /// Entries are queued that the driver has not submitted yet.
     unsubmitted: Cell<bool>,
     driver: RefCell<Option<Waker>>,
-    /// Completions are only posted from inside `io_uring_enter`.
-    defer_taskrun: bool,
 }
 
 impl Ring {
-    /// A ring for the current thread, with the most efficient setup the
-    /// kernel accepts: a single submitting thread whose completions are
-    /// processed when it asks for them (Linux 6.1), cooperative task work
-    /// (5.19), or the defaults.
+    /// A ring for the current thread, in the kernel's default task work
+    /// mode: completions are posted as they happen and each fires the
+    /// eventfd, while the thread sleeps in the runtime's `epoll_wait`.
+    ///
+    /// Deferred task work (`IORING_SETUP_DEFER_TASKRUN`) is not used: its
+    /// completions wait for the thread to ask for them, and the eventfd that
+    /// tells it to was seen to stop firing after the first deferred
+    /// completion (a 1-CPU NixOS VM on Linux 6.18), leaving the ring stalled.
+    /// Cooperative task work (`IORING_SETUP_COOP_TASKRUN`) also waits for the
+    /// thread to enter the kernel, so it is avoided for the same reason.
     fn new(entries: u32) -> io::Result<Rc<Self>> {
-        let deferred = IoUring::builder()
-            .setup_single_issuer()
-            .setup_defer_taskrun()
+        let uring = match IoUring::builder()
             .setup_submit_all()
             .setup_cqsize(entries * 4)
-            .build(entries);
-        let (uring, defer_taskrun) = match deferred {
-            Ok(uring) => {
-                tracing::debug!("io_uring ring with deferred task work");
-                (uring, true)
+            .build(entries)
+        {
+            Ok(uring) => uring,
+            Err(err) => {
+                tracing::debug!(error = %err, "io_uring ring without SUBMIT_ALL and CQSIZE");
+                IoUring::new(entries)?
             }
-            Err(deferred) => match IoUring::builder()
-                .setup_coop_taskrun()
-                .setup_submit_all()
-                .setup_cqsize(entries * 4)
-                .build(entries)
-            {
-                Ok(uring) => {
-                    tracing::debug!(%deferred, "io_uring ring with cooperative task work");
-                    (uring, false)
-                }
-                Err(coop) => {
-                    tracing::debug!(%deferred, %coop, "io_uring ring with default task work");
-                    (IoUring::new(entries)?, false)
-                }
-            },
         };
 
         // SAFETY: eventfd returns a new descriptor or -1.
@@ -134,7 +122,6 @@ impl Ring {
             eventfd: AsyncFd::with_interest(eventfd, tokio::io::Interest::READABLE)?,
             unsubmitted: Cell::new(false),
             driver: RefCell::new(None),
-            defer_taskrun,
         }))
     }
 
@@ -212,9 +199,9 @@ impl Ring {
         {
             let mut uring = self.uring.borrow_mut();
             let pending = uring.submission().len();
-            let wants_events = self.defer_taskrun
-                || uring.submission().taskrun()
-                || uring.submission().cq_overflow();
+            // Completions are posted without asking; entering for them is
+            // only needed to flush an overflowed completion queue.
+            let wants_events = uring.submission().cq_overflow();
             if pending > 0 || wants_events {
                 loop {
                     // SAFETY: plain io_uring_enter without an argument.
