@@ -12,6 +12,8 @@ pub mod migration;
 pub mod routes;
 pub mod storage;
 pub mod twirp;
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub mod uring;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -29,6 +31,34 @@ pub struct App {
     pub state: AppState,
     /// Stops the cleanup scheduler.
     pub shutdown: CancellationToken,
+    /// The rings serving connections and file I/O, when `io_uring` is in use.
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    rings: Option<Arc<uring::RingPool>>,
+}
+
+/// Starts the `io_uring` threads when configured and the kernel allows it.
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+fn start_rings(config: &Config) -> Option<Arc<uring::RingPool>> {
+    if !config.io_uring {
+        tracing::info!("io_uring is disabled: connections are served by hyper, file I/O blocks");
+        return None;
+    }
+    match uring::RingPool::start(config.io_uring_threads) {
+        Ok(pool) => {
+            tracing::info!(
+                threads = config.io_uring_threads,
+                "Connections and file I/O use io_uring"
+            );
+            Some(Arc::new(pool))
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "io_uring is unavailable: connections are served by hyper, file I/O blocks"
+            );
+            None
+        }
+    }
 }
 
 impl App {
@@ -48,12 +78,14 @@ impl App {
             .context("Database migration failed")?;
         tracing::info!("Database migrated");
 
+        #[cfg(all(target_os = "linux", feature = "io-uring"))]
+        let rings = start_rings(&config);
         let backend = match &config.storage_driver {
             config::StorageDriver::Filesystem => {
-                let io = storage::io::FileIo::new(
-                    config.storage_filesystem_io_uring,
-                    config.storage_filesystem_io_uring_threads,
-                );
+                #[cfg(all(target_os = "linux", feature = "io-uring"))]
+                let io = storage::io::FileIo::new(rings.clone());
+                #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+                let io = storage::io::FileIo::Tokio;
                 let fs = storage::fs::FsStorage::new(&config.storage_filesystem_path, io)
                     .await
                     .with_context(|| {
@@ -100,6 +132,8 @@ impl App {
         Ok(Self {
             state,
             shutdown: CancellationToken::new(),
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            rings,
         })
     }
 
@@ -122,6 +156,27 @@ impl App {
             tracing::info!("Cleanup jobs are disabled");
         } else {
             cleanup::spawn_scheduler(&self.state.cleanup, &self.shutdown);
+        }
+
+        #[cfg(all(target_os = "linux", feature = "io-uring"))]
+        if let Some(rings) = &self.rings {
+            let shutdown = self.shutdown.clone();
+            let watcher = tokio::spawn(async move {
+                signal.await;
+                shutdown.cancel();
+            });
+            let served = uring::server::serve(
+                rings,
+                listener.into_std()?,
+                self.router(),
+                self.shutdown.clone(),
+            )
+            .await;
+            watcher.abort();
+            served?;
+            tracing::info!("Waiting for ongoing merges...");
+            self.state.storage.wait_for_ongoing_merges().await;
+            return Ok(());
         }
 
         // Small responses (Twirp, response heads ahead of a download body)

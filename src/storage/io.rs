@@ -1,29 +1,39 @@
 //! File I/O for filesystem storage.
 //!
 //! With the `io-uring` feature on Linux, file data and metadata operations
-//! (open, read, write, close, statx, rename, unlink, mkdir) run on a small pool
-//! of `tokio-uring` worker threads, each owning its own ring and current-thread
-//! runtime; the multi-threaded server runtime hands them jobs over channels.
-//! Operations `io_uring` has no opcode for (readdir, statvfs, recursive delete,
-//! `copy_file_range`) run on tokio's blocking pool. When `io_uring` is disabled or
-//! the kernel refuses a ring at startup, file data moves through `std::fs` on
-//! tokio's blocking pool and metadata operations through `tokio::fs`.
+//! (open, read, write, close, statx, rename, unlink, mkdir) go through the
+//! rings of a [`RingPool`], the same rings that serve client connections. On
+//! a ring thread (where requests are handled) an operation runs on that
+//! thread's ring as a local task; elsewhere it is handed to a ring thread.
+//! Operations `io_uring` has no opcode for (readdir, statvfs, recursive
+//! delete, `copy_file_range`) run on tokio's blocking pool. When `io_uring` is
+//! disabled or the kernel refuses a ring at startup, file data moves through
+//! `std::fs` on tokio's blocking pool and metadata operations through
+//! `tokio::fs`.
 //!
-//! Data is never copied in user space: body frames are written as they arrive,
-//! batched into vectored writes, and each read lands in a buffer sized to what
-//! is left of the file, which then goes out as-is.
+//! Data is never copied in user space: body frames are written as they
+//! arrive, batched into vectored writes, and each read lands in a buffer sized
+//! to what is left of the file, which then goes out as-is. Downloads served
+//! by the `io_uring` server don't read at all: a [`FileBody`] tells it which
+//! files to splice to the socket.
 
-use std::io::{self, IoSlice, Read, Write};
+use std::any::Any;
+use std::io::{self, IoSlice, Write};
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
 use futures::{Stream, StreamExt};
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+use crate::uring::RingPool;
+
 pub type ByteStream = Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>;
 
 /// Largest single read, and the size writes are batched to before submission.
-const CHUNK_SIZE: usize = 1024 * 1024;
+pub const CHUNK_SIZE: usize = 1024 * 1024;
 
 /// Most buffers in one vectored write, well under `IOV_MAX`.
 const MAX_BATCH_BUFFERS: usize = 64;
@@ -33,39 +43,91 @@ fn chunk_len(size: u64, position: u64) -> usize {
     usize::try_from(size.saturating_sub(position)).map_or(CHUNK_SIZE, |left| left.min(CHUNK_SIZE))
 }
 
+/// A download body made of whole files in order, which the `io_uring`
+/// server splices from the page cache to the socket instead of reading. It
+/// travels as a response extension next to an ordinary body streaming the
+/// same bytes, for every other way of sending the response.
+#[derive(Clone)]
+pub struct FileBody(Arc<FileBodyInner>);
+
+struct FileBodyInner {
+    segments: Vec<FileSegment>,
+    len: u64,
+    /// Lives as long as the body: the download's Storage Reader Lease.
+    _guard: Arc<dyn Any + Send + Sync>,
+    /// Why sending must stop, if it must; checked between chunks.
+    abort: Box<dyn Fn() -> Option<String> + Send + Sync>,
+}
+
+#[derive(Clone)]
+pub enum FileSegment {
+    /// Opened up front, so a missing file was noticed before the response.
+    Open(Arc<std::fs::File>, u64),
+    /// Opened when its turn comes.
+    Path(PathBuf),
+}
+
+impl FileBody {
+    pub fn new(
+        segments: Vec<FileSegment>,
+        len: u64,
+        guard: Arc<dyn Any + Send + Sync>,
+        abort: impl Fn() -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(FileBodyInner {
+            segments,
+            len,
+            _guard: guard,
+            abort: Box::new(abort),
+        }))
+    }
+
+    /// Total length of the files.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.0.len
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.len == 0
+    }
+
+    #[must_use]
+    pub fn segments(&self) -> &[FileSegment] {
+        &self.0.segments
+    }
+
+    /// # Errors
+    ///
+    /// If sending must stop, for instance because the download lost its lease.
+    pub fn check(&self) -> io::Result<()> {
+        match (self.0.abort)() {
+            Some(reason) => Err(io::Error::other(reason)),
+            None => Ok(()),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum FileIo {
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    Uring(std::sync::Arc<uring::UringPool>),
+    Uring(Arc<RingPool>),
     Tokio,
 }
 
 impl FileIo {
-    /// `io_uring` when requested and available, otherwise blocking I/O on
-    /// tokio's blocking pool.
-    pub fn new(use_io_uring: bool, threads: usize) -> Self {
-        if !use_io_uring {
-            tracing::info!("Filesystem storage I/O uses blocking I/O (io_uring disabled)");
-            return Self::Tokio;
+    /// `io_uring` on `pool`'s rings when there is a pool, otherwise blocking
+    /// I/O on tokio's blocking pool.
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[must_use]
+    pub fn new(pool: Option<Arc<RingPool>>) -> Self {
+        if let Some(pool) = pool {
+            Self::Uring(pool)
+        } else {
+            tracing::info!("Filesystem storage I/O uses blocking I/O");
+            Self::Tokio
         }
-
-        #[cfg(all(target_os = "linux", feature = "io-uring"))]
-        match uring::UringPool::start(threads) {
-            Ok(pool) => {
-                tracing::info!(threads, "Filesystem storage I/O uses io_uring");
-                return Self::Uring(std::sync::Arc::new(pool));
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "io_uring is unavailable, falling back to blocking I/O");
-            }
-        }
-
-        #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
-        {
-            let _ = threads;
-            tracing::info!("Filesystem storage I/O uses blocking I/O (built without io_uring)");
-        }
-        Self::Tokio
     }
 
     #[must_use]
@@ -81,19 +143,74 @@ impl FileIo {
     ///
     /// If the file can't be opened.
     pub async fn read_file(&self, path: PathBuf) -> io::Result<ByteStream> {
+        let (file, size) = self.open(path).await?;
+        Ok(self.read_open(file, size))
+    }
+
+    /// Opens `path` for reading, returning the file and its size.
+    ///
+    /// # Errors
+    ///
+    /// If the file can't be opened.
+    pub async fn open(&self, path: PathBuf) -> io::Result<(Arc<std::fs::File>, u64)> {
         match self {
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            Self::Uring(pool) => pool.read_file(path).await,
+            Self::Uring(pool) => {
+                pool.run(move || async move {
+                    let fd = crate::uring::open(&path, libc::O_RDONLY, 0).await?;
+                    let size =
+                        crate::uring::file_size(std::os::fd::AsRawFd::as_raw_fd(&fd)).await?;
+                    Ok((Arc::new(std::fs::File::from(fd)), size))
+                })
+                .await?
+            }
             Self::Tokio => {
-                let (file, size) = blocking(move || {
+                blocking(move || {
                     let file = std::fs::File::open(&path)?;
                     let size = file.metadata()?.len();
-                    Ok((file, size))
+                    Ok((Arc::new(file), size))
                 })
-                .await?;
-                Ok(read_blocking(file, size))
+                .await
             }
         }
+    }
+
+    /// Streams the `size` bytes of an open file.
+    #[must_use = "the stream reads nothing until polled"]
+    pub fn read_open(&self, file: Arc<std::fs::File>, size: u64) -> ByteStream {
+        match self {
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            Self::Uring(pool) => uring_io::read(pool, file, size),
+            Self::Tokio => read_blocking(file, size),
+        }
+    }
+
+    /// Streams the files of `body` one after another.
+    #[must_use = "the stream reads nothing until polled"]
+    pub fn read_segments(&self, body: &FileBody) -> ByteStream {
+        let io = self.clone();
+        let segments = body.segments().to_vec();
+        Box::pin(async_stream::stream! {
+            for segment in segments {
+                let mut stream = match segment {
+                    FileSegment::Open(file, size) => io.read_open(file, size),
+                    FileSegment::Path(path) => match io.read_file(path).await {
+                        Ok(stream) => stream,
+                        Err(err) => {
+                            yield Err(err);
+                            return;
+                        }
+                    },
+                };
+                while let Some(chunk) = stream.next().await {
+                    let failed = chunk.is_err();
+                    yield chunk;
+                    if failed {
+                        return;
+                    }
+                }
+            }
+        })
     }
 
     /// Writes `stream` to a newly created (or truncated) file at `path` and
@@ -110,7 +227,7 @@ impl FileIo {
         let batches = batch(stream);
         match self {
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            Self::Uring(pool) => pool.write_file(path, batches).await,
+            Self::Uring(pool) => uring_io::write(pool, path, batches).await,
             Self::Tokio => {
                 let mut file = blocking(move || std::fs::File::create(&path)).await?;
                 let mut written = 0u64;
@@ -135,11 +252,7 @@ impl FileIo {
         let result = match self {
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             Self::Uring(pool) => pool
-                .run(move || async move {
-                    tokio_uring::fs::statx(&path)
-                        .await
-                        .map(|stat| stat.stx_size)
-                })
+                .run(move || async move { crate::uring::path_size(&path).await })
                 .await
                 .and_then(|result| result),
             Self::Tokio => tokio::fs::metadata(&path).await.map(|meta| meta.len()),
@@ -158,7 +271,7 @@ impl FileIo {
         match self {
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             Self::Uring(pool) => {
-                pool.run(move || async move { tokio_uring::fs::rename(&from, &to).await })
+                pool.run(move || async move { crate::uring::rename(&from, &to).await })
                     .await?
             }
             Self::Tokio => tokio::fs::rename(from, to).await,
@@ -172,7 +285,7 @@ impl FileIo {
         match self {
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             Self::Uring(pool) => {
-                pool.run(move || async move { tokio_uring::fs::remove_file(&path).await })
+                pool.run(move || async move { crate::uring::unlink(&path).await })
                     .await?
             }
             Self::Tokio => tokio::fs::remove_file(path).await,
@@ -186,7 +299,7 @@ impl FileIo {
         match self {
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             Self::Uring(pool) => {
-                pool.run(move || async move { tokio_uring::fs::create_dir_all(&path).await })
+                pool.run(move || async move { crate::uring::create_dir_all(&path).await })
                     .await?
             }
             Self::Tokio => tokio::fs::create_dir_all(path).await,
@@ -194,9 +307,8 @@ impl FileIo {
     }
 }
 
-/// Groups body frames (hyper yields up to a few hundred KiB each) into batches
-/// of about `CHUNK_SIZE` bytes, each written with one vectored write instead of
-/// being copied together first.
+/// Groups body frames into batches of about `CHUNK_SIZE` bytes, each written
+/// with one vectored write instead of being copied together first.
 fn batch<S>(stream: S) -> impl Stream<Item = io::Result<Vec<Bytes>>> + Send + 'static
 where
     S: Stream<Item = io::Result<Bytes>> + Send + 'static,
@@ -228,7 +340,7 @@ fn batch_len(batch: &[Bytes]) -> u64 {
 }
 
 /// Drops the first `written` bytes of `batch` after a short write.
-fn consume(batch: &mut Vec<Bytes>, mut written: usize) {
+pub fn consume(batch: &mut Vec<Bytes>, mut written: usize) {
     let mut done = 0;
     for buffer in batch.iter_mut() {
         if written < buffer.len() {
@@ -256,12 +368,20 @@ fn write_all_vectored(file: &mut std::fs::File, mut batch: Vec<Bytes>) -> io::Re
 
 /// Streams a `size`-byte file from the blocking pool, reading the next chunk
 /// while the current one is being sent.
-fn read_blocking(file: std::fs::File, size: u64) -> ByteStream {
-    let read = move |file: std::fs::File, position: u64| {
+fn read_blocking(file: Arc<std::fs::File>, size: u64) -> ByteStream {
+    let read = move |file: Arc<std::fs::File>, position: u64| {
         tokio::task::spawn_blocking(move || {
-            let len = chunk_len(size, position);
-            let mut chunk = Vec::with_capacity(len);
-            (&file).take(len as u64).read_to_end(&mut chunk)?;
+            let mut chunk = vec![0; chunk_len(size, position)];
+            let mut filled = 0;
+            while filled < chunk.len() {
+                match file.read_at(&mut chunk[filled..], position + filled as u64) {
+                    Ok(0) => break,
+                    Ok(read) => filled += read,
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            chunk.truncate(filled);
             Ok::<_, io::Error>((file, chunk))
         })
     };
@@ -304,185 +424,100 @@ where
 }
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
-mod uring {
-    use std::future::Future;
+mod uring_io {
     use std::io;
+    use std::os::fd::AsRawFd;
     use std::path::PathBuf;
-    use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use bytes::{Bytes, BytesMut};
     use futures::{Stream, StreamExt};
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::mpsc;
 
     use super::{ByteStream, chunk_len, consume};
+    use crate::uring::{self, RingPool};
 
-    type Job = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send>;
-
-    /// Worker threads that each run a `tokio-uring` runtime. Jobs are closures
-    /// producing `!Send` futures, spawned onto the worker's local executor.
-    pub struct UringPool {
-        workers: Vec<mpsc::UnboundedSender<Job>>,
-        next: AtomicUsize,
+    /// Streams an open file, read on a ring with two chunks of read-ahead
+    /// keeping the ring busy while the consumer sends.
+    pub fn read(pool: &RingPool, file: Arc<std::fs::File>, size: u64) -> ByteStream {
+        let (chunks_sender, chunks) = mpsc::channel::<io::Result<Bytes>>(2);
+        let spawned = pool.spawn(move || async move {
+            let fd = file.as_raw_fd();
+            let mut position = 0u64;
+            while position < size {
+                // Sized to what is left, so a small file never holds a whole
+                // chunk, and the end needs no extra read to find.
+                let len = chunk_len(size, position);
+                let (result, buffer) =
+                    uring::read_at(fd, BytesMut::with_capacity(len), len, position).await;
+                let item = match result {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        position += read as u64;
+                        Ok(buffer.freeze())
+                    }
+                    Err(err) => Err(err),
+                };
+                let failed = item.is_err();
+                // A send error means the reader went away.
+                if chunks_sender.send(item).await.is_err() || failed {
+                    break;
+                }
+            }
+        });
+        if let Err(err) = spawned {
+            return Box::pin(futures::stream::once(async move { Err(err) }));
+        }
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(chunks))
     }
 
-    impl UringPool {
-        pub fn start(threads: usize) -> io::Result<Self> {
-            // tokio-uring panics if it cannot create a ring, so probe first:
-            // seccomp profiles and `kernel.io_uring_disabled` refuse it here.
-            io_uring::IoUring::new(8)?;
-
-            let workers = (0..threads)
-                .map(|index| {
-                    let (sender, mut receiver) = mpsc::unbounded_channel::<Job>();
-                    std::thread::Builder::new()
-                        .name(format!("io-uring-{index}"))
-                        .spawn(move || {
-                            tokio_uring::builder().entries(256).start(async move {
-                                while let Some(job) = receiver.recv().await {
-                                    tokio_uring::spawn(job());
-                                }
-                            });
-                        })?;
-                    Ok(sender)
-                })
-                .collect::<io::Result<_>>()?;
-
-            Ok(Self {
-                workers,
-                next: AtomicUsize::new(0),
-            })
-        }
-
-        fn submit(&self, job: Job) -> io::Result<()> {
-            let index = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
-            self.workers[index]
-                .send(job)
-                .map_err(|_| io::Error::other("io_uring worker has stopped"))
-        }
-
-        /// Runs `f` on a worker and returns its output. The job runs to
-        /// completion even if the caller stops waiting for it.
-        pub async fn run<F, Fut, T>(&self, f: F) -> io::Result<T>
-        where
-            F: FnOnce() -> Fut + Send + 'static,
-            Fut: Future<Output = T> + 'static,
-            T: Send + 'static,
-        {
-            let (sender, receiver) = oneshot::channel();
-            self.submit(Box::new(move || {
-                Box::pin(async move {
-                    let _ = sender.send(f().await);
-                })
-            }))?;
-            receiver
-                .await
-                .map_err(|_| io::Error::other("io_uring worker dropped the operation"))
-        }
-
-        pub async fn read_file(&self, path: PathBuf) -> io::Result<ByteStream> {
-            let (opened_sender, opened) = oneshot::channel::<io::Result<()>>();
-            // Two chunks of read-ahead keep the ring busy while the consumer sends.
-            let (chunks_sender, chunks) = mpsc::channel::<io::Result<Bytes>>(2);
-
-            self.submit(Box::new(move || {
-                Box::pin(async move {
-                    let file = match tokio_uring::fs::File::open(&path).await {
-                        Ok(file) => file,
-                        Err(err) => {
-                            let _ = opened_sender.send(Err(err));
-                            return;
+    pub async fn write<S>(pool: &RingPool, path: PathBuf, stream: S) -> io::Result<u64>
+    where
+        S: Stream<Item = io::Result<Vec<Bytes>>> + Send + 'static,
+    {
+        // The body stream is driven by the caller; only the file operations
+        // run on the ring. One batch waits while another is written.
+        let (batches_sender, mut batches) = mpsc::channel::<Vec<Bytes>>(1);
+        let write = pool.run(move || async move {
+            let file =
+                uring::open(&path, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o666).await?;
+            let fd = file.as_raw_fd();
+            let written = async {
+                let mut position = 0u64;
+                while let Some(mut batch) = batches.recv().await {
+                    while !batch.is_empty() {
+                        let (result, returned) = uring::writev_at(fd, batch, position).await;
+                        batch = returned;
+                        let written = result?;
+                        if written == 0 {
+                            return Err(io::ErrorKind::WriteZero.into());
                         }
-                    };
-                    // The size bounds every buffer, so a small file never holds
-                    // a whole chunk, and the end needs no extra read to find.
-                    let size = match file.statx().await {
-                        Ok(stat) => stat.stx_size,
-                        Err(err) => {
-                            let _ = opened_sender.send(Err(err));
-                            let _ = file.close().await;
-                            return;
-                        }
-                    };
-                    let _ = opened_sender.send(Ok(()));
-
-                    let mut position = 0u64;
-                    while position < size {
-                        let buffer = BytesMut::with_capacity(chunk_len(size, position));
-                        let (result, buffer) = file.read_at(buffer, position).await;
-                        let item = match result {
-                            Ok(0) => break,
-                            Ok(read) => {
-                                position += read as u64;
-                                Ok(buffer.freeze())
-                            }
-                            Err(err) => Err(err),
-                        };
-                        let failed = item.is_err();
-                        // A send error means the reader went away.
-                        if chunks_sender.send(item).await.is_err() || failed {
-                            break;
-                        }
-                    }
-                    let _ = file.close().await;
-                })
-            }))?;
-
-            opened
-                .await
-                .map_err(|_| io::Error::other("io_uring worker dropped the operation"))??;
-            Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
-                chunks,
-            )))
-        }
-
-        pub async fn write_file<S>(&self, path: PathBuf, stream: S) -> io::Result<u64>
-        where
-            S: Stream<Item = io::Result<Vec<Bytes>>> + Send + 'static,
-        {
-            // The body stream is driven here, on the server runtime; only the
-            // file operations run on the ring. One batch waits while another
-            // is written.
-            let (batches_sender, mut batches) = mpsc::channel::<Vec<Bytes>>(1);
-            let write = self.run(move || async move {
-                let file = tokio_uring::fs::File::create(&path).await?;
-                let written = async {
-                    let mut position = 0u64;
-                    while let Some(mut batch) = batches.recv().await {
-                        while !batch.is_empty() {
-                            let (result, returned) = file.writev_at(batch, position).await;
-                            batch = returned;
-                            let written = result?;
-                            if written == 0 {
-                                return Err(io::ErrorKind::WriteZero.into());
-                            }
-                            position += written as u64;
-                            consume(&mut batch, written);
-                        }
-                    }
-                    Ok(position)
-                }
-                .await;
-                let closed = file.close().await;
-                written.and_then(|position| closed.map(|()| position))
-            });
-
-            let feed = async move {
-                let mut stream = std::pin::pin!(stream);
-                while let Some(batch) = stream.next().await {
-                    // The writer stopped early: its own error is the one to report.
-                    if batches_sender.send(batch?).await.is_err() {
-                        break;
+                        position += written as u64;
+                        consume(&mut batch, written);
                     }
                 }
-                Ok::<_, io::Error>(())
-            };
+                Ok(position)
+            }
+            .await;
+            let closed = uring::close(file).await;
+            written.and_then(|position| closed.map(|()| position))
+        });
 
-            let (written, body) = tokio::join!(write, feed);
-            // A failed body must not look like a complete file.
-            body?;
-            written?
-        }
+        let feed = async move {
+            let mut stream = std::pin::pin!(stream);
+            while let Some(batch) = stream.next().await {
+                // The writer stopped early: its own error is the one to report.
+                if batches_sender.send(batch?).await.is_err() {
+                    break;
+                }
+            }
+            Ok::<_, io::Error>(())
+        };
+
+        let (written, body) = tokio::join!(write, feed);
+        // A failed body must not look like a complete file.
+        body?;
+        written?
     }
 }
 
@@ -587,11 +622,13 @@ mod tests {
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn io_uring_round_trip() {
-        let io = FileIo::new(true, 2);
-        if !io.is_io_uring() {
-            eprintln!("io_uring unavailable on this host, skipping");
-            return;
-        }
-        round_trip(io).await;
+        let pool = match RingPool::start(2) {
+            Ok(pool) => std::sync::Arc::new(pool),
+            Err(err) => {
+                eprintln!("io_uring unavailable on this host ({err}), skipping");
+                return;
+            }
+        };
+        round_trip(FileIo::new(Some(pool))).await;
     }
 }

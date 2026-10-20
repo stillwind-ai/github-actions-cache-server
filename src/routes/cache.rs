@@ -146,12 +146,17 @@ pub async fn download(
 
     // Once headers are out, a failing stream aborts the connection, which the
     // client sees as a short read against Content-Length.
-    Ok((
+    let mut response = (
         [
             (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
             (header::CONTENT_LENGTH, download.size.to_string()),
         ],
         Body::from_stream(download.stream),
     )
-        .into_response())
+        .into_response();
+    // The io_uring server splices these files instead of polling the body.
+    if let Some(files) = download.files {
+        response.extensions_mut().insert(files);
+    }
+    Ok(response)
 }

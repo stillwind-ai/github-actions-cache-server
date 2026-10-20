@@ -57,9 +57,9 @@ config:
   # Can also be provided via existingSecret (key: MANAGEMENT_API_KEY).
   managementApiKey: ''
 
-  # -- Read and write cache files through io_uring when the kernel and the
-  # container's seccomp profile allow it; otherwise the server falls back to
-  # regular file I/O on its own.
+  # -- Serve connections and read and write cache files through io_uring when
+  # the kernel and the container's seccomp profile allow it; otherwise the
+  # server falls back to hyper and regular file I/O on its own.
   ioUring: true
 
   # -- Cache storage.

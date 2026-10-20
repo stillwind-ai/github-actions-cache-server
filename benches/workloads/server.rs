@@ -24,7 +24,7 @@ pub fn binary() -> String {
 
 impl Server {
     /// Starts a server; `env` overrides the inherited environment, so
-    /// `STORAGE_FILESYSTEM_IO_URING=false cargo bench` reaches it too.
+    /// `IO_URING=false cargo bench` reaches it too.
     pub async fn start(env: &[(&str, &str)]) -> Self {
         let admin_url = std::env::var("TEST_DATABASE_URL")
             .unwrap_or_else(|_| "postgres://postgres@127.0.0.1:5432/postgres".into());

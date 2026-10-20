@@ -17,10 +17,11 @@ path = "src/main.rs"
 
 [features]
 default = ["io-uring"]
-# Filesystem storage I/O through io_uring (tokio-uring, Linux only). Without it,
-# or when the kernel refuses an io_uring instance at startup, file I/O goes
-# through tokio::fs.
-io-uring = ["dep:tokio-uring", "dep:io-uring"]
+# Client connections and filesystem storage I/O through io_uring (Linux only).
+# Without it, or when the kernel refuses an io_uring instance at startup,
+# connections are served by hyper on tokio and file I/O goes through the
+# blocking pool.
+io-uring = ["dep:io-uring", "dep:libc", "dep:httparse", "dep:httpdate", "dep:tower-service"]
 
 [dependencies]
 anyhow = "1"
@@ -35,6 +36,7 @@ bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 dotenvy = "0.15"
 futures = "0.3"
+http-body = "1"
 http-body-util = "0.1"
 jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "rust_crypto"] }
 prometheus = { version = "0.14", default-features = false, features = ["process"] }
@@ -57,8 +59,11 @@ url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-tokio-uring = { version = "0.5", optional = true, features = ["bytes"] }
+httparse = { version = "1", optional = true }
+httpdate = { version = "1", optional = true }
 io-uring = { version = "0.6", optional = true }
+libc = { version = "0.2", optional = true }
+tower-service = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

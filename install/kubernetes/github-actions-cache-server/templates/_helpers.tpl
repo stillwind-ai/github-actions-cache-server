@@ -156,14 +156,14 @@ Generate environment variables from config values.
 - name: MANAGEMENT_API_KEY
   value: {{ .Values.config.managementApiKey | quote }}
 {{- end }}
+- name: IO_URING
+  value: {{ .Values.config.ioUring | quote }}
 {{/* Storage driver */}}
 - name: STORAGE_DRIVER
   value: {{ .Values.config.storage.driver | quote }}
 {{- if eq .Values.config.storage.driver "filesystem" }}
 - name: STORAGE_FILESYSTEM_PATH
   value: {{ .Values.config.storage.filesystem.path | quote }}
-- name: STORAGE_FILESYSTEM_IO_URING
-  value: {{ .Values.config.ioUring | quote }}
 {{- else if eq .Values.config.storage.driver "s3" }}
 {{- with .Values.config.storage.s3 }}
 {{- if .bucket }}

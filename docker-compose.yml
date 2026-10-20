@@ -36,7 +36,7 @@ services:
   #   depends_on:
   #     - postgres
   #   # The default Docker seccomp profile blocks io_uring; the server then
-  #   # falls back to regular file I/O. To allow io_uring:
+  #   # falls back to hyper and regular file I/O. To allow io_uring:
   #   # security_opt:
   #   #   - seccomp=unconfined
   #   environment:
