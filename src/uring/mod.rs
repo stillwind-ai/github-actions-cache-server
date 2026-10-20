@@ -97,15 +97,24 @@ impl Ring {
             .setup_cqsize(entries * 4)
             .build(entries);
         let (uring, defer_taskrun) = match deferred {
-            Ok(uring) => (uring, true),
-            Err(_) => match IoUring::builder()
+            Ok(uring) => {
+                tracing::debug!("io_uring ring with deferred task work");
+                (uring, true)
+            }
+            Err(deferred) => match IoUring::builder()
                 .setup_coop_taskrun()
                 .setup_submit_all()
                 .setup_cqsize(entries * 4)
                 .build(entries)
             {
-                Ok(uring) => (uring, false),
-                Err(_) => (IoUring::new(entries)?, false),
+                Ok(uring) => {
+                    tracing::debug!(%deferred, "io_uring ring with cooperative task work");
+                    (uring, false)
+                }
+                Err(coop) => {
+                    tracing::debug!(%deferred, %coop, "io_uring ring with default task work");
+                    (IoUring::new(entries)?, false)
+                }
             },
         };
 
@@ -217,6 +226,7 @@ impl Ring {
                             None,
                         )
                     };
+                    tracing::trace!(pending, wants_events, ?entered, "io_uring_enter");
                     match entered {
                         Ok(_) => break,
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
@@ -246,6 +256,9 @@ impl Ring {
                     },
                 )
             }));
+        }
+        if !completions.is_empty() {
+            tracing::trace!(completions = completions.len(), "io_uring completions");
         }
         for (user_data, completion) in completions {
             if user_data == CANCEL_TAG {
