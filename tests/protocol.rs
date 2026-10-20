@@ -277,6 +277,23 @@ async fn concurrent_uploads_of_the_same_key_are_rejected() {
     assert!(server.create_entry("busy", "v1").await.is_none());
 }
 
+/// Matches GitHub: a Twirp error rather than `{"ok": false}`. sccache's
+/// storage check only tolerates the former (see `upload_in_progress`).
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_upload_is_a_twirp_already_exists_error() {
+    let server = start().await;
+    assert!(server.create_entry("busy", "v1").await.is_some());
+    let response = server
+        .twirp(
+            "CreateCacheEntry",
+            json!({ "key": "busy", "version": "v1" }),
+        )
+        .await;
+    assert_eq!(response.status(), 409);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["code"], "already_exists");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rejects_incomplete_or_unknown_uploads() {
     let server = start().await;
