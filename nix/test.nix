@@ -5,6 +5,10 @@
 {
   name = "github-actions-cache-server";
 
+  # A healthy run takes about a minute. The driver's default of an hour turns
+  # a server that stops answering into an hour-long `nix flake check`.
+  globalTimeout = 600;
+
   nodes.machine = {
     imports = [ module ];
     virtualisation.memorySize = 1024;
@@ -32,16 +36,19 @@
         "signature",
     ])
     service = "http://localhost:3000/twirp/github.actions.results.api.v1.CacheService"
+    # Every request has a deadline, so a hung server fails the request that
+    # hung instead of the whole test at globalTimeout.
+    curl = "curl -sSf --max-time 30"
 
     def twirp(method, body):
         return json.loads(machine.succeed(
-            f"curl -sSf -X POST -H 'authorization: Bearer {token}' "
+            f"{curl} -X POST -H 'authorization: Bearer {token}' "
             f"-H 'content-type: application/json' -d '{json.dumps(body)}' {service}/{method}"
         ))
 
     machine.wait_for_unit("github-actions-cache-server.service")
     machine.wait_for_open_port(3000)
-    assert machine.succeed("curl -sSf http://localhost:3000/health") == "healthy"
+    assert machine.succeed(f"{curl} http://localhost:3000/health") == "healthy"
     # The systemd sandbox must leave io_uring usable.
     machine.succeed("journalctl -u github-actions-cache-server | grep -q 'uses io_uring'")
 
@@ -49,14 +56,14 @@
         created = twirp("CreateCacheEntry", {"key": "nixos-key", "version": "v1"})
         assert created["ok"], created
         machine.succeed("head -c 3000000 /dev/urandom > /tmp/payload")
-        machine.succeed(f"curl -sSf -X PUT --data-binary @/tmp/payload '{created['signed_upload_url']}'")
+        machine.succeed(f"{curl} -X PUT --data-binary @/tmp/payload '{created['signed_upload_url']}'")
         assert twirp("FinalizeCacheEntryUpload", {"key": "nixos-key", "version": "v1"})["ok"]
 
     with subtest("restore it, also after a restart"):
         for _ in range(2):
             found = twirp("GetCacheEntryDownloadURL", {"key": "nixos-", "restore_keys": [], "version": "v1"})
             assert found["ok"] and found["matched_key"] == "nixos-key", found
-            machine.succeed(f"curl -sSf -o /tmp/restored '{found['signed_download_url']}'")
+            machine.succeed(f"{curl} -o /tmp/restored '{found['signed_download_url']}'")
             machine.succeed("cmp /tmp/payload /tmp/restored")
             machine.systemctl("restart github-actions-cache-server.service")
             machine.wait_for_open_port(3000)
